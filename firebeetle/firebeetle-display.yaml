@@ -1,0 +1,964 @@
+esphome:
+  name: firebeetle-display
+  on_boot:
+    priority: 600
+    then:
+      - lambda: 'id(just_woke) = true;'
+      # --- 90s safe window so HA/OTA can connect ---
+      - logger.log: "Boot: staying awake 90s for HA/OTA window."
+      - deep_sleep.prevent: deep_sleep_ctrl
+      - script.execute: wait_for_data_then_refresh   # draw during the window
+      - delay: 90s
+
+      # After the window, decide mode based on HA button + quiet hours
+      - if:
+          condition:
+            lambda: 'return id(stay_awake_flag).has_state() && id(stay_awake_flag).state;'
+          then:
+            - logger.log: "Stay-awake ON — keep running (no deep sleep)."
+            - deep_sleep.prevent: deep_sleep_ctrl
+          else:
+            - logger.log: "Stay-awake OFF — normal cycle (sleep scheduling)."
+            - deep_sleep.allow: deep_sleep_ctrl
+            - script.execute: sleep_until_next_wake
+
+esp32:
+  board: firebeetle32
+  framework:
+    type: arduino
+    sdkconfig_options:
+      CONFIG_ESP_TASK_WDT_TIMEOUT_S: "60"
+
+logger:
+
+api:
+ota:
+  platform: esphome
+
+
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  manual_ip:
+    static_ip: 192.168.31.254
+    gateway: 192.168.31.1
+    subnet: 255.255.255.0
+
+globals:
+  - id: initial_draw_done
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  - id: just_woke
+    type: bool
+    restore_value: no
+
+deep_sleep:
+  id: deep_sleep_ctrl
+
+script:
+
+  # -------------------------------------------------------------
+  # One-shot refresh scheduler (batches many HA updates into one)
+  # -------------------------------------------------------------
+  - id: schedule_refresh
+    mode: restart
+    then:
+      - delay: 5s
+      - script.execute: schedule_refresh_full
+
+
+  # -------------------------------------------------------------
+  # Boot / wake data wait
+  # -------------------------------------------------------------
+  - id: wait_for_data_then_refresh
+    mode: restart
+    then:
+      - logger.log: "Waiting for HA data (timeout 60s)…"
+      - wait_until:
+          condition:
+            lambda: |-
+              auto t = id(ha_time).now();
+              if (!t.is_valid()) return false;
+              bool ready_weather =
+                id(smhi_temp).has_state() &&
+                id(smhi_h1_time).has_state() &&
+                id(smhi_h1_temp).has_state() &&
+                id(smhi_h1_condition).has_state();
+              bool ready_run   = id(garmin_run_days).has_state()   || id(garmin_ran_today).has_state();
+              bool ready_bike  = id(garmin_bike_days).has_state()  || id(garmin_biked_today).has_state();
+              return ready_weather && (ready_run || ready_bike);
+          timeout: 60s
+
+      - script.execute: schedule_refresh
+      - lambda: 'id(just_woke) = false;'
+
+
+
+  # -------------------------------------------------------------
+  # BWR-safe full refresh (double waveform)
+  # -------------------------------------------------------------
+  - id: schedule_refresh_full
+    mode: restart
+    then:
+      - component.update: battery_voltage
+      - component.update: epd
+      - component.update: epd
+
+
+  # -------------------------------------------------------------
+  # Deep-sleep scheduler
+  # -------------------------------------------------------------
+  - id: sleep_until_next_wake
+    mode: restart
+    then:
+      - wait_until:
+          condition:
+            lambda: 'return !id(schedule_refresh).is_running() && !id(schedule_refresh_full).is_running();'
+          timeout: 60s
+      - deep_sleep.enter:
+          id: deep_sleep_ctrl
+          sleep_duration: !lambda |-
+            uint32_t ms = 5UL * 60UL * 1000UL;
+            auto t = id(ha_time).now();
+            if (t.is_valid()) {
+              const int QUIET_START = 23*60 + 45;  // 23:45
+              const int QUIET_END   = 8*60 + 30;   // 08:30
+              int mins = t.hour * 60 + t.minute;
+              int secs = t.second;
+              bool in_quiet = (mins >= QUIET_START) || (mins < QUIET_END);
+              if (in_quiet) {
+                int remaining_s;
+                if (mins < QUIET_END) {
+                  remaining_s = (QUIET_END * 60) - (mins * 60 + secs);
+                } else {
+                  // 23:45–23:59: sleep through midnight to QUIET_END
+                  remaining_s = (24 * 60 * 60 - (mins * 60 + secs)) + (QUIET_END * 60);
+                }
+                if (remaining_s <= 0) remaining_s = 60;
+                ms = (uint32_t)remaining_s * 1000UL;
+              } else {
+                int next_half = (t.minute < 30) ? 30 : 60;
+                int remaining_s = (next_half*60) - (t.minute*60 + t.second);
+                if (remaining_s <= 0) remaining_s = 30*60;
+                ms = (uint32_t)remaining_s * 1000UL;
+              }
+            }
+            ESP_LOGI("sleep", "Deep sleeping for %u ms", (unsigned)ms);
+            return ms;
+
+
+spi:
+  clk_pin: GPIO18
+  mosi_pin: GPIO23
+
+font:
+  - file: "fonts/Roboto-Medium.ttf"
+    id: roboto
+    size: 30
+    glyphs:
+      - &sv_glyphs " ABCDEFGHIJKLMNOPQRSTUVWXYZÅÄÖabcdefghijklmnopqrstuvwxyzåäö0123456789°:/.%—-"
+
+  - file: "fonts/Roboto-Medium.ttf"
+    id: roboto_h1
+    size: 72
+    glyphs: [*sv_glyphs]
+
+  - file: "fonts/Roboto-Medium.ttf"
+    id: roboto_small
+    size: 24
+    glyphs: [*sv_glyphs]
+
+  - file: 'fonts/materialdesignicons-webfont.ttf'
+    id: font_mdi_large
+    size: 96
+    glyphs: &mdi-weather-glyphs
+      - "\U000F0590" # weather-cloudy
+      - "\U000F0F2F" # weather-cloudy-alert
+      - "\U000F0E6E" # weather-cloudy-arrow-right
+      - "\U000F18F6" # weather-cloudy-clock
+      - "\U000F1B5A" # weather-dust
+      - "\U000F0591" # weather-fog
+      - "\U000F0592" # weather-hail
+      - "\U000F0F30" # weather-hazy
+      - "\U000F0898" # weather-hurricane
+      - "\U000F1C78" # weather-hurricane-outline
+      - "\U000F0593" # weather-lightning
+      - "\U000F067E" # weather-lightning-rainy
+      - "\U000F1D15" # weather-moonset
+      - "\U000F1D16" # weather-moonset-down
+      - "\U000F1D17" # weather-moonset-up
+      - "\U000F0594" # weather-clear-night
+      - "\U000F0F31" # weather-night-partly-cloudy
+      - "\U000F0595" # weather-partly-cloudy
+      - "\U000F0F32" # weather-partly-lightning
+      - "\U000F0F33" # weather-partly-rainy
+      - "\U000F0F34" # weather-partly-snowy
+      - "\U000F0F35" # weather-partly-snowy-rainy
+      - "\U000F0596" # weather-pouring
+      - "\U000F0597" # weather-rainy
+      - "\U000F0598" # weather-snowy
+      - "\U000F0F36" # weather-snowy-heavy
+      - "\U000F067F" # weather-snowy-rainy
+      - "\U000F0599" # weather-sunny
+      - "\U000F0F37" # weather-sunny-alert
+      - "\U000F14E4" # weather-sunny-off
+      - "\U000F059A" # weather-sunset
+      - "\U000F059B" # weather-sunset-down
+      - "\U000F059C" # weather-sunset-up
+      - "\U000F0F38" # weather-tornado
+      - "\U000F059D" # weather-windy
+      - "\U000F059E" # weather-windy-variant
+      - "\U000F1A71" # snowflake-thermometer
+      - "\U000F05A9" # wifi
+      - "\U000F0928" # wifi-strength-4
+      - "\U000F0925" # wifi-strength-3
+      - "\U000F0922" # wifi-strength-2
+      - "\U000F091F" # wifi-strength-1
+      - "\U000F092B" # wifi-strength-alert-outline
+      - "\U000F054B" # umbrella-outline
+      - "\U000F0F29" # snowflake-alert
+      - "\U000F070E" # run
+
+  - file: 'fonts/materialdesignicons-webfont.ttf'
+    id: font_mdi_medlarge
+    size: 18
+    glyphs:
+      - "\U000F05A9"
+      - "\U000F0928"
+      - "\U000F0925"
+      - "\U000F0922"
+      - "\U000F091F"
+      - "\U000F092B"
+      - "\U000F054B"
+      - "\U000F0F29"
+      - "\U000F0535"
+      - "\U000F0533"
+
+  - file: 'fonts/materialdesignicons-webfont.ttf'
+    id: font_mdi_medium
+    size: 36
+    glyphs: *mdi-weather-glyphs
+
+  - file: 'fonts/materialdesignicons-webfont.ttf'
+    id: font_mdi_badge
+    size: 36
+    glyphs:
+      - "\U000F02A0"  # ghost
+      - "\U000F0250"  # fish
+      - "\U000F0240"  # flag-variant
+      - "\U000F024A"  # flower
+      - "\U000F05E2"  # candle
+      - "\U000F0E30"  # firework
+      - "\U000F050F"  # fire
+      - "\U000F018F"  # earth
+      - "\U000F0768"  # clover
+      - "\U000F00EB"  # cake-variant
+      - "\U000F0157"  # trophy
+      - "\U000F12BA" # string_lights
+
+  - file: 'fonts/materialdesignicons-webfont.ttf'
+    id: font_mdi_run_24
+    size: 24
+    glyphs:
+      - "\U000F070E"  # mdi-run
+      - "\U000F00A3"  # mdi-bike
+      - "\U000F0079"  # battery (100%)
+      - "\U000F0082"  # battery-90
+      - "\U000F0081"  # battery-80
+      - "\U000F0080"  # battery-70
+      - "\U000F007F"  # battery-60
+      - "\U000F007E"  # battery-50
+      - "\U000F007D"  # battery-40
+      - "\U000F007C"  # battery-30
+      - "\U000F007B"  # battery-20
+      - "\U000F007A"  # battery-10
+      - "\U000F0083"  # battery-outline (empty)
+
+text_sensor:
+  - platform: homeassistant
+    id: garmin_run_days
+    entity_id: input_text.garmin_run_days_this_month
+    on_value:
+      then:
+        - script.execute: schedule_refresh
+
+  - platform: homeassistant
+    id: garmin_bike_days
+    entity_id: input_text.garmin_bike_days
+
+  - platform: homeassistant
+    id: epd_board_theme
+    entity_id: sensor.epd_board_theme
+    on_value: { then: [ script.execute: schedule_refresh ] }
+
+  - platform: homeassistant
+    id: epd_month_badges
+    entity_id: sensor.epd_month_badges
+    on_value:
+      then:
+        - logger.log:
+            format: "epd_month_badges received: %s"
+            args: ['id(epd_month_badges).state.c_str()']
+        - script.execute: schedule_refresh
+
+  # ── SMHI hourly times (now individual sensors, no attribute) ──────────────
+
+  - platform: homeassistant
+    id: smhi_h1_time
+    entity_id: sensor.smhi_h1_time
+    on_value:
+      then:
+        - if:
+            condition:
+              lambda: 'return id(stay_awake_flag).has_state() && id(stay_awake_flag).state;'
+            then:
+              - script.execute: schedule_refresh
+
+  - platform: homeassistant
+    id: smhi_h2_time
+    entity_id: sensor.smhi_h2_time
+
+  - platform: homeassistant
+    id: smhi_h3_time
+    entity_id: sensor.smhi_h3_time
+
+  - platform: homeassistant
+    id: smhi_h4_time
+    entity_id: sensor.smhi_h4_time
+
+  # ── SMHI hourly conditions ────────────────────────────────────────────────
+
+  - platform: homeassistant
+    id: smhi_h1_condition
+    entity_id: sensor.smhi_h1_condition
+    on_value:
+      then:
+        - if:
+            condition:
+              lambda: 'return id(stay_awake_flag).has_state() && id(stay_awake_flag).state;'
+            then:
+              - script.execute: schedule_refresh
+
+  - platform: homeassistant
+    id: smhi_h2_condition
+    entity_id: sensor.smhi_h2_condition
+
+  - platform: homeassistant
+    id: smhi_h3_condition
+    entity_id: sensor.smhi_h3_condition
+
+  - platform: homeassistant
+    id: smhi_h4_condition
+    entity_id: sensor.smhi_h4_condition
+
+  # ── Current condition ─────────────────────────────────────────────────────
+
+  - platform: homeassistant
+    id: smhi_condition
+    entity_id: sensor.smhi_condition
+
+  - platform: homeassistant
+    id: epd_theme
+    entity_id: sensor.epd_theme
+    on_value: { then: [ script.execute: schedule_refresh ] }
+
+  - platform: homeassistant
+    id: sunrise_hhmm
+    entity_id: sensor.sunrise_hhmm
+  - platform: homeassistant
+    id: sunset_hhmm
+    entity_id: sensor.sunset_hhmm
+
+sensor:
+  # ── SMHI hourly temps (now individual sensors, no attribute) ──────────────
+
+  - platform: adc
+    pin: GPIO34
+    id: battery_voltage
+    name: "Battery Voltage"
+    attenuation: 11db
+    update_interval: never
+    filters:
+      - multiply: 2.0
+
+  - platform: homeassistant
+    id: smhi_h1_temp
+    entity_id: sensor.smhi_h1_temp
+    on_value:
+      then:
+        - if:
+            condition:
+              lambda: 'return id(stay_awake_flag).has_state() && id(stay_awake_flag).state;'
+            then:
+              - script.execute: schedule_refresh
+
+  - platform: homeassistant
+    id: smhi_h2_temp
+    entity_id: sensor.smhi_h2_temp
+
+  - platform: homeassistant
+    id: smhi_h3_temp
+    entity_id: sensor.smhi_h3_temp
+
+  - platform: homeassistant
+    id: smhi_h4_temp
+    entity_id: sensor.smhi_h4_temp
+
+  # ── Current conditions (now individual sensors, no attribute) ─────────────
+
+  - platform: homeassistant
+    id: smhi_temp
+    entity_id: sensor.smhi_temperature
+    on_value:
+      then:
+        - if:
+            condition:
+              lambda: 'return id(stay_awake_flag).has_state() && id(stay_awake_flag).state;'
+            then:
+              - script.execute: schedule_refresh
+
+  - platform: homeassistant
+    id: smhi_humidity
+    entity_id: sensor.smhi_humidity
+
+  - platform: homeassistant
+    id: smhi_pressure
+    entity_id: sensor.smhi_pressure
+
+  - platform: homeassistant
+    id: smhi_wind
+    entity_id: sensor.smhi_wind_speed
+
+binary_sensor:
+  - platform: homeassistant
+    id: stay_awake_flag
+    entity_id: input_boolean.epd_stay_awake
+    on_state:
+      then:
+        - if:
+            condition:
+              lambda: 'return id(stay_awake_flag).state;'
+            then:
+              - logger.log: "Stay-awake ON — preventing deep sleep."
+              - deep_sleep.prevent: deep_sleep_ctrl
+              - lambda: 'id(just_woke) = true;'
+              - script.execute: wait_for_data_then_refresh
+            else:
+              - logger.log: "Stay-awake OFF — resuming 30-min cycle."
+              - deep_sleep.allow: deep_sleep_ctrl
+              - lambda: 'id(just_woke) = true;'
+              - script.execute: wait_for_data_then_refresh
+              - script.execute: sleep_until_next_wake
+
+  - platform: homeassistant
+    id: garmin_ran_today
+    entity_id: binary_sensor.garmin_ran_today
+    on_state: { then: [ script.execute: schedule_refresh ] }
+
+  - platform: homeassistant
+    id: garmin_biked_today
+    entity_id: binary_sensor.garmin_biked_today
+    on_state: { then: [ script.execute: schedule_refresh ] }
+
+time:
+  - platform: homeassistant
+    id: ha_time
+    on_time:
+      - seconds: 0
+        minutes: /30
+        then:
+          - if:
+              condition:
+                lambda: |-
+                  auto t = id(ha_time).now();
+                  if (!t.is_valid()) return false;
+                  int mins = t.hour * 60 + t.minute;
+                  if ((mins >= (23*60+45)) || (mins < (8*60+30))) return false; // quiet hours
+                  bool ready_weather =
+                    id(smhi_temp).has_state() &&
+                    id(smhi_h1_time).has_state() &&
+                    id(smhi_h1_temp).has_state() &&
+                    id(smhi_h1_condition).has_state();
+                  bool ready_run   = id(garmin_run_days).has_state()   || id(garmin_ran_today).has_state();
+                  bool ready_bike  = id(garmin_bike_days).has_state()  || id(garmin_biked_today).has_state();
+                  return ready_weather && (ready_run || ready_bike);
+              then: { script.execute: schedule_refresh }
+              else: { logger.log: "Skipping refresh: quiet hours or data not ready." }
+
+      # ±15 min window around midnight — catches device waking slightly before/after 00:00
+      - seconds: 0
+        minutes: 45,50,55
+        hours: 23
+        then: { script.execute: schedule_refresh }
+      - seconds: 0
+        minutes: 0,5,10,15
+        hours: 0
+        then: { script.execute: schedule_refresh }
+
+      - seconds: 0
+        minutes: 30
+        hours: 8
+        then: { script.execute: schedule_refresh }
+
+display:
+  - platform: waveshare_epaper
+    id: epd
+    model: 7.50in-bv3-bwr
+    cs_pin: GPIO16
+    reset_duration: 500ms
+    dc_pin: GPIO17
+    reset_pin: GPIO26
+    busy_pin: { number: GPIO25 }
+    update_interval: never
+    rotation: 90°
+    lambda: |-
+      // For 7.5" 800x480; rotation 90° -> width 480
+      const int W = 480;
+
+      // Colors (INVERTED on this panel)
+      auto BLACK = Color(255,255,255);  // white ink
+      auto RED   = Color(255,0,0);
+      auto WHITE = Color(0,0,0);        // black background
+
+      const int TOP_MARGIN = 32;
+
+      // ---------- helpers ----------
+      auto str_has = [](std::string s, const char* needle) {
+        std::transform(s.begin(), s.end(), s.begin(), ::tolower);
+        std::string n(needle);
+        std::transform(n.begin(), n.end(), n.begin(), ::tolower);
+        return s.find(n) != std::string::npos;
+      };
+
+      // Map MDI *names* to codepoints (must exist in your font_mdi_badge)
+      auto mdi_icon_for = [&](const std::string& name) -> const char* {
+        if (name.empty()) return nullptr;
+        std::string k = name; std::transform(k.begin(), k.end(), k.begin(), ::tolower);
+        if (k == "ghost")                         return "\U000F02A0";
+        if (k == "fish")                          return "\U000F0250";
+        if (k == "flag-variant" || k == "flag")   return "\U000F0240";
+        if (k == "flower")                        return "\U000F024A";
+        if (k == "candle")                        return "\U000F05E2";
+        if (k == "firework")                      return "\U000F0E30";
+        if (k == "fire")                          return "\U000F050F";
+        if (k == "earth")                         return "\U000F018F";
+        if (k == "clover")                        return "\U000F0768";
+        if (k == "cake-variant" || k == "cake")   return "\U000F00EB";
+        if (k == "trophy")                        return "\U000F0157";
+        if (k == "pumpkin")                       return "\U000F02A0"; // fallback to ghost
+        return nullptr;
+      };
+
+      // --- QUIET HOURS CHECK ---
+      auto now = id(ha_time).now();
+      bool time_ok = now.is_valid();
+      int mins = time_ok ? now.hour * 60 + now.minute : 0;
+      bool quiet = time_ok && ((mins >= (23*60+45)) || (mins < (8*60+30))); // 23:45–08:29
+
+      if (quiet) {
+        it.fill(WHITE);
+        it.print(W/2, 80, id(font_mdi_large), RED, TextAlign::TOP_CENTER, "\U000F0594"); // night
+        it.print(W/2, 220, id(roboto_h1), BLACK, TextAlign::TOP_CENTER, "Sover");
+        if (time_ok) {
+          it.strftime(W/2, 310, id(roboto), BLACK, TextAlign::TOP_CENTER, "%H:%M", id(ha_time).now());
+        } else {
+          it.print(W/2, 310, id(roboto), BLACK, TextAlign::TOP_CENTER, "--:--");
+        }
+        std::string sunrise = (id(sunrise_hhmm).has_state() && id(sunrise_hhmm).state.length() > 0)
+                                ? std::string(id(sunrise_hhmm).state.c_str()) : std::string("");
+        if (sunrise.size()) {
+          it.printf(W/2, 360, id(roboto_small), BLACK, TextAlign::TOP_CENTER, "Soluppg. %s", sunrise.c_str());
+        }
+        it.print(W/2, 410, id(roboto_small), BLACK, TextAlign::TOP_CENTER, "Uppdaterar 08:30");
+        return;
+      }
+
+      // -----------------------------------------------------------------
+      // DAYTIME LAYOUT
+      // -----------------------------------------------------------------
+
+      it.fill(WHITE);
+
+      // ----- Board THEME badge (top-right) from HA (sensor.epd_board_theme) -----
+      std::string theme = (id(epd_board_theme).has_state() && id(epd_board_theme).state.length()>0)
+                          ? std::string(id(epd_board_theme).state.c_str()) : std::string("none");
+      const char* theme_icon = nullptr;
+      {
+        std::string t = theme; std::transform(t.begin(), t.end(), t.begin(), ::tolower);
+        if      (t == "halloween")     theme_icon = mdi_icon_for("ghost");
+        else if (t == "christmas")     theme_icon = mdi_icon_for("pine-tree");
+        else if (t == "kraftskiva")    theme_icon = mdi_icon_for("fish");
+        else if (t == "national_day")  theme_icon = mdi_icon_for("flag-variant");
+        else if (t == "valborg")       theme_icon = mdi_icon_for("fire");
+        else if (t == "midsummer")     theme_icon = mdi_icon_for("flower");
+        else if (t == "olympics")      theme_icon = mdi_icon_for("trophy");
+      }
+
+      // pick sprinkle icon to match theme (used later)
+      const char* sprinkle_icon = nullptr;
+      {
+        std::string t = theme; std::transform(t.begin(), t.end(), t.begin(), ::tolower);
+        if      (t == "halloween")     sprinkle_icon = mdi_icon_for("ghost");
+        else if (t == "christmas")     sprinkle_icon = mdi_icon_for("pine-tree");
+        else if (t == "kraftskiva")    sprinkle_icon = mdi_icon_for("fish");
+        else if (t == "national_day")  sprinkle_icon = mdi_icon_for("flag-variant");
+        else if (t == "valborg")       sprinkle_icon = mdi_icon_for("fire");
+        else if (t == "midsummer")     sprinkle_icon = mdi_icon_for("flower");
+        else if (t == "olympics")      sprinkle_icon = mdi_icon_for("trophy");
+      }
+
+      // Condition string from HA
+      std::string cond = (id(smhi_condition).has_state() && id(smhi_condition).state.length() > 0)
+                          ? std::string(id(smhi_condition).state.c_str())
+                          : std::string("okänd");
+
+      // --- Night detection using sunrise/sunset ---
+      auto parse_hhmm = [&](const std::string &s)->int {
+        if (s.size() < 4) return -1;
+        int hh = 0, mm = 0; sscanf(s.c_str(), "%d:%d", &hh, &mm);
+        return hh*60 + mm;
+      };
+      int now_min = time_ok ? now.hour*60 + now.minute : -1;
+      int sr = (id(sunrise_hhmm).has_state() && id(sunrise_hhmm).state.length() >= 4)
+                ? parse_hhmm(id(sunrise_hhmm).state.c_str()) : -1;
+      int ss = (id(sunset_hhmm).has_state() && id(sunset_hhmm).state.length() >= 4)
+                ? parse_hhmm(id(sunset_hhmm).state.c_str()) : -1;
+      bool is_night = false;
+      if (now_min >= 0 && sr >= 0 && ss >= 0) {
+        is_night = (now_min < sr) || (now_min >= ss);
+      } else {
+        std::string lc = cond; std::transform(lc.begin(), lc.end(), lc.begin(), ::tolower);
+        is_night = (lc.find("night") != std::string::npos) || (lc.find("natt") != std::string::npos);
+      }
+
+      // --- Weather icon mapper (correct moon variants at night) ---
+      auto weather_icon_for = [&](const std::string& c, bool night) -> const char* {
+        std::string s = c; std::transform(s.begin(), s.end(), s.begin(), ::tolower);
+
+        // Precip & special cases take priority regardless of day/night
+        if (str_has(s, "thunder") || str_has(s, "lightning")) return "\U000F067E";
+        if (str_has(s, "drizzle") || str_has(s, "rain"))      return "\U000F0597";
+        if (str_has(s, "snow"))                               return "\U000F0598";
+        if (str_has(s, "hail"))                               return "\U000F0592";
+        if (str_has(s, "fog"  ) || str_has(s, "mist"))        return "\U000F0591";
+        if (str_has(s, "wind" ) || str_has(s, "breez"))       return "\U000F059D";
+        if (str_has(s, "hazy" ) || str_has(s, "smoke"))       return "\U000F0F30";
+
+        // Normalize "clear/partly/cloudy/overcast" families
+        bool clearish   = str_has(s, "clear") || str_has(s, "sunny") || str_has(s, "fair");
+        bool partlyish  = str_has(s, "partly") || str_has(s, "few") || str_has(s, "scattered");
+        bool cloudyish  = str_has(s, "cloud") || str_has(s, "overcast");
+
+        // Night-first handling: ensure no sun shows up after dark
+        if (night) {
+          if (clearish)                       return "\U000F0594"; // clear-night (moon)
+          if (partlyish || cloudyish)         return "\U000F0F31"; // night-partly-cloudy (moon+cloud)
+          return "\U000F0590"; // neutral cloudy fallback
+        }
+
+        // Daytime
+        if (clearish)                         return "\U000F0599"; // sunny
+        if (partlyish)                        return "\U000F0595"; // partly-cloudy
+        if (cloudyish)                        return "\U000F0590"; // cloudy
+
+        // Default fallback
+        return "\U000F0590";
+      };
+
+      // --- Header ---
+      it.printf(W/2, TOP_MARGIN, id(roboto_h1), BLACK, TextAlign::TOP_CENTER, "UPPSALA");
+
+      // Event sprinkles flanking the city name
+      if (sprinkle_icon != nullptr) {
+        const int HEADER_Y = TOP_MARGIN + 4;
+        const int ICON_OFFSET_X = 140;   // distance from center
+        it.print(W/2 - ICON_OFFSET_X, HEADER_Y,
+                id(font_mdi_badge), RED, TextAlign::TOP_CENTER, sprinkle_icon);
+        it.print(W/2 + ICON_OFFSET_X, HEADER_Y,
+                id(font_mdi_badge), RED, TextAlign::TOP_CENTER, sprinkle_icon);
+      }
+
+      // Layout anchors
+      int big_row_top = TOP_MARGIN + 78;
+      int forecast_top = big_row_top + 150;
+
+      // --- Big row: icon + temperature ---
+      int row_y = big_row_top;
+      int center_x = W/2;
+      int gap = 22;
+
+      const char* icon_code = weather_icon_for(cond, is_night);
+      it.print(center_x - gap/2, row_y, id(font_mdi_large), RED, TextAlign::TOP_RIGHT, icon_code);
+
+      if (id(smhi_temp).has_state()) {
+        it.printf(center_x + gap/2, row_y + 10, id(roboto_h1), RED, TextAlign::TOP_LEFT, "%.0f°C", id(smhi_temp).state);
+      } else {
+        it.print(center_x + gap/2, row_y + 10, id(roboto_h1), RED, TextAlign::TOP_LEFT, "—°C");
+      }
+
+      // --- "Känns som" row ---
+      auto feels_like = [&]()->float {
+        if (!(id(smhi_temp).has_state())) return NAN;
+        float T = id(smhi_temp).state;
+        float V = id(smhi_wind).has_state() ? id(smhi_wind).state : 0.0f;
+        float H = id(smhi_humidity).has_state() ? id(smhi_humidity).state : 50.0f;
+        if (T <= 10.0f && V > 1.34f) {
+          float Vkph = V * 3.6f;
+          return 13.12f + 0.6215f*T - 11.37f*powf(Vkph, 0.16f) + 0.3965f*T*powf(Vkph, 0.16f);
+        }
+        if (T >= 27.0f && H >= 40.0f) {
+          float F = T*9.0f/5.0f + 32.0f;
+          float HI = -42.379f + 2.04901523f*F + 10.14333127f*H - 0.22475541f*F*H
+                    - 0.00683783f*F*F - 0.05481717f*H*H + 0.00122874f*F*F*H
+                    + 0.00085282f*F*H*H - 0.00000199f*F*F*H*H;
+          return (HI - 32.0f) * 5.0f/9.0f;
+        }
+        return T;
+      }();
+      if (!isnan(feels_like)) {
+        it.printf(W/2, row_y + 96, id(roboto), BLACK, TextAlign::TOP_CENTER, "Känns som %.0f°C", feels_like);
+      }
+
+      // --- Forecast row ---
+      int row2_y = forecast_top;
+      int col_w  = 100;
+      int start_x = (W - col_w*4)/2;
+
+      auto draw_slot = [&](int col, const std::string &time_str, const std::string &cond_str, float temp) {
+        int x = start_x + col*col_w + col_w/2;
+        const int time_y = row2_y;
+        const int icon_y = time_y + 34;
+        const int temp_y = icon_y + 44;
+
+        const char* t = time_str.size() ? time_str.c_str() : "--:--";
+        it.print(x, time_y, id(roboto), BLACK, TextAlign::TOP_CENTER, t);
+        it.print(x, icon_y, id(font_mdi_medium), BLACK, TextAlign::TOP_CENTER, weather_icon_for(cond_str, is_night));
+
+        if (!isnan(temp)) it.printf(x, temp_y, id(roboto), BLACK, TextAlign::TOP_CENTER, "%.0f°C", temp);
+        else              it.print(x, temp_y, id(roboto), BLACK, TextAlign::TOP_CENTER, "—°C");
+      };
+
+      auto str_or = [&](auto* ts, const char* dflt) -> std::string {
+        return (ts && ts->has_state() && ts->state.length() > 0)
+              ? std::string(ts->state.c_str()) : std::string(dflt);
+      };
+      auto f_or_nan = [&](auto* s) -> float {
+        return (s && s->has_state()) ? s->state : NAN;
+      };
+
+      draw_slot(0, str_or(id(smhi_h1_time), ""), str_or(id(smhi_h1_condition), "cloudy"), f_or_nan(id(smhi_h1_temp)));
+      draw_slot(1, str_or(id(smhi_h2_time), ""), str_or(id(smhi_h2_condition), "cloudy"), f_or_nan(id(smhi_h2_temp)));
+      draw_slot(2, str_or(id(smhi_h3_time), ""), str_or(id(smhi_h3_condition), "cloudy"), f_or_nan(id(smhi_h3_temp)));
+      draw_slot(3, str_or(id(smhi_h4_time), ""), str_or(id(smhi_h4_condition), "cloudy"), f_or_nan(id(smhi_h4_temp)));
+
+      // ---------- Parse per-month badges from HA ("day:mdi;day:mdi;...") ----------
+      std::map<int, std::string> month_badge;  // day -> mdi-name
+      if (id(epd_month_badges).has_state() && id(epd_month_badges).state.length() > 0) {
+        std::string s = std::string(id(epd_month_badges).state.c_str());
+        // split by ';'
+        size_t start = 0;
+        while (start <= s.size()) {
+          size_t sep = s.find(';', start);
+          std::string token = s.substr(start, sep == std::string::npos ? std::string::npos : sep - start);
+          if (!token.empty()) {
+            size_t colon = token.find(':');
+            if (colon != std::string::npos) {
+              int day = atoi(token.substr(0, colon).c_str());
+              std::string key = token.substr(colon + 1);
+              if (day >= 1 && day <= 31 && !key.empty()) month_badge[day] = key;
+            }
+          }
+          if (sep == std::string::npos) break;
+          start = sep + 1;
+        }
+      }
+
+      // ----- Parse monthly run days "1,5,12,21" from HA (CSV from input_text) -----
+      bool ran_day[32]; for (int i=0;i<32;i++) ran_day[i]=false;
+      if (id(garmin_run_days).has_state() && id(garmin_run_days).state.length() > 0) {
+        std::string s = id(garmin_run_days).state.c_str();
+        size_t start = 0;
+        while (start <= s.size()) {
+          size_t sep = s.find(',', start);
+          std::string tok = s.substr(start, sep == std::string::npos ? std::string::npos : sep - start);
+          if (!tok.empty()) {
+            int dnum = atoi(tok.c_str());
+            if (dnum >= 1 && dnum <= 31) ran_day[dnum] = true;
+          }
+          if (sep == std::string::npos) break;
+          start = sep + 1;
+        }
+      }
+
+      // ----- Parse monthly BIKE days "1,5,12,21" from HA (CSV) -----
+      bool biked_day[32]; for (int i=0;i<32;i++) biked_day[i] = false;
+      if (id(garmin_bike_days).has_state() && id(garmin_bike_days).state.length() > 0) {
+        std::string s = id(garmin_bike_days).state.c_str();
+        size_t start = 0;
+        while (start <= s.size()) {
+          size_t sep = s.find(',', start);
+          std::string tok = s.substr(start, sep == std::string::npos ? std::string::npos : sep - start);
+          if (!tok.empty()) {
+            int dnum = atoi(tok.c_str());
+            if (dnum >= 1 && dnum <= 31) biked_day[dnum] = true;
+          }
+          if (sep == std::string::npos) break;
+          start = sep + 1;
+        }
+      }
+
+      // --- Calendar (relative positioning) ---
+      if (id(ha_time).now().is_valid()) {
+        const int row_gap  = 28;
+        const int colw     = W / 7;
+        const int FORECAST_BLOCK_HEIGHT = 110;
+        const int CAL_TOP_MARGIN        = 40;
+        int cal_y = row2_y + FORECAST_BLOCK_HEIGHT + CAL_TOP_MARGIN;
+        const int header_gap = 36;
+
+        const char* HEAD[7] = {"M","T","O","T","F","L","S"};
+        for (int c = 0; c < 7; ++c) {
+          it.print(c * colw + colw/2, cal_y, id(roboto_small), BLACK, TextAlign::TOP_CENTER, HEAD[c]);
+        }
+
+        time_t now_ts = id(ha_time).now().timestamp;
+        struct tm lt = *localtime(&now_ts);
+        int year  = lt.tm_year + 1900;
+        int mon   = lt.tm_mon;
+        int today = lt.tm_mday;
+
+        struct tm first = lt;
+        first.tm_mday = 1; first.tm_hour = 12; first.tm_min = 0; first.tm_sec = 0;
+        mktime(&first);
+        int first_mon_idx = (first.tm_wday + 6) % 7;
+
+        auto is_leap = [&](int y){ return (y%4==0) && ((y%100!=0) || (y%400==0)); };
+        int dim;
+        switch (mon) {
+          case 1:  dim = is_leap(year) ? 29 : 28; break;     // Feb
+          case 3: case 5: case 8: case 10: dim = 30; break;  // Apr, Jun, Sep, Nov
+          default: dim = 31; break;
+        }
+
+        const int NUM_FONT_H = 24;     // roboto_small size
+        const int RUN_FONT_H = 24;     // font_mdi_run_24 size
+
+        bool ran_today_flag =
+          (id(garmin_ran_today).has_state() && id(garmin_ran_today).state) ||
+          ((today >= 1 && today <= 31) ? ran_day[today] : false);
+
+        bool biked_today_flag =
+          (id(garmin_biked_today).has_state() && id(garmin_biked_today).state) ||
+          ((today >= 1 && today <= 31) ? biked_day[today] : false);
+
+        int start_y = cal_y + header_gap;
+        for (int d = 1; d <= dim; ++d) {
+          int cell = first_mon_idx + (d - 1);
+          int r = cell / 7, c = cell % 7;
+          int x = c * colw + colw / 2;
+          int y = start_y + r * row_gap;
+
+          bool is_today = (d == today);
+          bool ran_on_day   = (d >= 1 && d <= 31) ? ran_day[d]   : false;
+          bool biked_on_day = (d >= 1 && d <= 31) ? biked_day[d] : false;
+
+          // Find badge early so we can use it in hide_num
+          auto badge_it = month_badge.find(d);
+          bool has_badge = (badge_it != month_badge.end() && mdi_icon_for(badge_it->second) != nullptr);
+
+          // Hide number when an icon is printed on top
+          bool hide_num = ran_on_day || biked_on_day || has_badge;
+
+          // Vertical center of date cell
+          int cy = y + (NUM_FONT_H / 2);
+
+          // 1) Number (unless hidden)
+          if (!hide_num) {
+            char buf[3]; snprintf(buf, sizeof(buf), "%d", d);
+            Color day_col = is_today ? RED : BLACK;
+            it.print(x, y, id(roboto_small), day_col, TextAlign::TOP_CENTER, buf);
+          }
+
+          // 2) Per-day badge from HA (with optional run/bike stack)
+          if (has_badge) {
+            const char* badge_icon = mdi_icon_for(badge_it->second);
+            if (badge_icon != nullptr) {
+              it.print(x, y - 8, id(font_mdi_badge), RED, TextAlign::TOP_CENTER, badge_icon);
+
+              const int ICON_NUDGE_Y = 2;
+
+              int stack_y = y + 18 + (RUN_FONT_H / 2);
+
+              if (ran_on_day && biked_on_day) {
+                it.print(x - 10, stack_y + ICON_NUDGE_Y, id(font_mdi_run_24), RED, TextAlign::CENTER, "\U000F070E");
+                it.print(x + 10, stack_y + ICON_NUDGE_Y, id(font_mdi_run_24), RED, TextAlign::CENTER, "\U000F00A3");
+              } else if (ran_on_day) {
+                it.print(x, stack_y + ICON_NUDGE_Y, id(font_mdi_run_24), RED, TextAlign::CENTER, "\U000F070E");
+              } else if (biked_on_day) {
+                it.print(x, stack_y + ICON_NUDGE_Y, id(font_mdi_run_24), RED, TextAlign::CENTER, "\U000F00A3");
+              }
+              continue; // skip default today highlight when badge is present
+            }
+          }
+
+          // 3) No badge: today ring/icon(s) or past-day icon(s)
+          const int ICON_NUDGE_Y = 2;
+          if (is_today) {
+            // Draw red ring first (always for today)
+            int thickness = 3;
+            int r_px = 17;
+            for (int k = 0; k < thickness; ++k) it.circle(x, cy+1, r_px - k, RED);
+
+            if (ran_on_day && biked_on_day) {
+              it.print(x - 10, cy + ICON_NUDGE_Y, id(font_mdi_run_24), RED, TextAlign::CENTER, "\U000F070E");
+              it.print(x + 10, cy + ICON_NUDGE_Y, id(font_mdi_run_24), RED, TextAlign::CENTER, "\U000F00A3");
+            } else if (ran_on_day) {
+              it.print(x, cy + ICON_NUDGE_Y, id(font_mdi_run_24), RED, TextAlign::CENTER, "\U000F070E");
+            } else if (biked_on_day) {
+              it.print(x, cy + ICON_NUDGE_Y, id(font_mdi_run_24), RED, TextAlign::CENTER, "\U000F00A3");
+            }
+          } else if (ran_on_day || biked_on_day) {
+            if (ran_on_day && biked_on_day) {
+              it.print(x - 10, cy + ICON_NUDGE_Y, id(font_mdi_run_24), RED, TextAlign::CENTER, "\U000F070E");
+              it.print(x + 10, cy + ICON_NUDGE_Y, id(font_mdi_run_24), RED, TextAlign::CENTER, "\U000F00A3");
+            } else if (ran_on_day) {
+              it.print(x, cy + ICON_NUDGE_Y, id(font_mdi_run_24), RED, TextAlign::CENTER, "\U000F070E");
+            } else { // biked only
+              it.print(x, cy + ICON_NUDGE_Y, id(font_mdi_run_24), RED, TextAlign::CENTER, "\U000F00A3");
+            }
+          }
+        }
+
+        int last_row   = (first_mon_idx + dim - 1) / 7;
+        int cal_bottom = start_y + last_row * row_gap;
+
+        int footer_y   = cal_bottom + 150;
+
+        // Footer timestamp
+        it.strftime(W/2, footer_y, id(roboto_small), BLACK, TextAlign::TOP_CENTER,
+                    "Uppdaterad kl %H:%M", id(ha_time).now());
+
+        // Battery icon + percentage (bottom right)
+        if (id(battery_voltage).has_state()) {
+          float vbat = id(battery_voltage).state;
+          float pct = (vbat - 3.3f) / (4.2f - 3.3f) * 100.0f;
+          pct = std::max(0.0f, std::min(100.0f, pct));
+          const char* bat_icon;
+          if      (pct >= 95) bat_icon = "\U000F0079"; // 100%
+          else if (pct >= 85) bat_icon = "\U000F0082"; // 90%
+          else if (pct >= 75) bat_icon = "\U000F0081"; // 80%
+          else if (pct >= 65) bat_icon = "\U000F0080"; // 70%
+          else if (pct >= 55) bat_icon = "\U000F007F"; // 60%
+          else if (pct >= 45) bat_icon = "\U000F007E"; // 50%
+          else if (pct >= 35) bat_icon = "\U000F007D"; // 40%
+          else if (pct >= 25) bat_icon = "\U000F007C"; // 30%
+          else if (pct >= 15) bat_icon = "\U000F007B"; // 20%
+          else if (pct >=  5) bat_icon = "\U000F007A"; // 10%
+          else                bat_icon = "\U000F0083"; // empty
+          it.printf(W - 30, footer_y + 4, id(roboto_small), BLACK, TextAlign::TOP_RIGHT, "%.0f%%", pct);
+          it.print(W - 4,   footer_y,     id(font_mdi_run_24), BLACK, TextAlign::TOP_RIGHT, bat_icon);
+        }
+      }

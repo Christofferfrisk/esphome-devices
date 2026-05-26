@@ -1,0 +1,182 @@
+# SMHI Direct API – Uppsala (lat 59.8586, lon 17.6389)
+# Add this to your HA configuration.yaml via: homeassistant: packages: smhi: !include smhi_direct.yaml
+# OR merge the rest: and template: blocks into your existing configuration.yaml.
+#
+# Wsymb2 codes:  1-2=clear  3-4=partly-cloudy  5-6=cloudy  7=fog
+#               8-10=rain-showers  11,21=thunder  12-14=sleet
+#               15-17=snow-showers  18-20=rain  22-24=sleet  25-27=snow
+
+rest:
+  - resource: "https://opendata-download-metfcst.smhi.se/api/category/snow1g/version/1/geotype/point/lon/17.6389/lat/59.8586/data.json"
+    scan_interval: 1800
+
+    sensor:
+
+      # ── Current conditions ──────────────────────────────────────────────
+
+      - name: "smhi_temperature"
+        unique_id: smhi_direct_temperature
+        value_template: "{{ value_json.timeSeries[0].data.air_temperature | round(1) }}"
+        unit_of_measurement: "°C"
+        device_class: temperature
+        state_class: measurement
+
+      - name: "smhi_humidity"
+        unique_id: smhi_direct_humidity
+        value_template: "{{ value_json.timeSeries[0].data.relative_humidity | round(0) }}"
+        unit_of_measurement: "%"
+        device_class: humidity
+        state_class: measurement
+
+      - name: "smhi_pressure"
+        unique_id: smhi_direct_pressure
+        value_template: "{{ value_json.timeSeries[0].data.air_pressure_at_mean_sea_level | round(1) }}"
+        unit_of_measurement: "hPa"
+        device_class: pressure
+        state_class: measurement
+
+      - name: "smhi_wind_speed"
+        unique_id: smhi_direct_wind_speed
+        value_template: "{{ value_json.timeSeries[0].data.wind_speed | round(1) }}"
+        unit_of_measurement: "m/s"
+        state_class: measurement
+
+      - name: "smhi_wsymb_current"
+        unique_id: smhi_direct_wsymb_current
+        value_template: "{{ value_json.timeSeries[0].data.symbol_code | int }}"
+
+      # ── Hourly: h1 ──────────────────────────────────────────────────────
+
+      - name: "smhi_h1_time"
+        unique_id: smhi_direct_h1_time
+        value_template: "{{ (value_json.timeSeries[1].time | as_datetime | as_local).strftime('%H:%M') }}"
+
+      - name: "smhi_h1_temp"
+        unique_id: smhi_direct_h1_temp
+        value_template: "{{ value_json.timeSeries[1].data.air_temperature | round(1) }}"
+        unit_of_measurement: "°C"
+
+      - name: "smhi_h1_wsymb"
+        unique_id: smhi_direct_h1_wsymb
+        value_template: "{{ value_json.timeSeries[1].data.symbol_code | int }}"
+
+      # ── Hourly: h2 ──────────────────────────────────────────────────────
+
+      - name: "smhi_h2_time"
+        unique_id: smhi_direct_h2_time
+        value_template: "{{ (value_json.timeSeries[2].time | as_datetime | as_local).strftime('%H:%M') }}"
+
+      - name: "smhi_h2_temp"
+        unique_id: smhi_direct_h2_temp
+        value_template: "{{ value_json.timeSeries[2].data.air_temperature | round(1) }}"
+        unit_of_measurement: "°C"
+
+      - name: "smhi_h2_wsymb"
+        unique_id: smhi_direct_h2_wsymb
+        value_template: "{{ value_json.timeSeries[2].data.symbol_code | int }}"
+
+      # ── Hourly: h3 ──────────────────────────────────────────────────────
+
+      - name: "smhi_h3_time"
+        unique_id: smhi_direct_h3_time
+        value_template: "{{ (value_json.timeSeries[3].time | as_datetime | as_local).strftime('%H:%M') }}"
+
+      - name: "smhi_h3_temp"
+        unique_id: smhi_direct_h3_temp
+        value_template: "{{ value_json.timeSeries[3].data.air_temperature | round(1) }}"
+        unit_of_measurement: "°C"
+
+      - name: "smhi_h3_wsymb"
+        unique_id: smhi_direct_h3_wsymb
+        value_template: "{{ value_json.timeSeries[3].data.symbol_code | int }}"
+
+      # ── Hourly: h4 ──────────────────────────────────────────────────────
+
+      - name: "smhi_h4_time"
+        unique_id: smhi_direct_h4_time
+        value_template: "{{ (value_json.timeSeries[4].time | as_datetime | as_local).strftime('%H:%M') }}"
+
+      - name: "smhi_h4_temp"
+        unique_id: smhi_direct_h4_temp
+        value_template: "{{ value_json.timeSeries[4].data.air_temperature | round(1) }}"
+        unit_of_measurement: "°C"
+
+      - name: "smhi_h4_wsymb"
+        unique_id: smhi_direct_h4_wsymb
+        value_template: "{{ value_json.timeSeries[4].data.symbol_code | int }}"
+
+
+# ── Template sensors: Wsymb2 → condition string ─────────────────────────────
+# These produce strings that match the ESPHome weather_icon_for() mapper.
+
+template:
+  - sensor:
+      - name: "smhi_condition"
+        unique_id: smhi_direct_condition
+        state: >
+          {% set w = states('sensor.smhi_wsymb_current') | int(0) %}
+          {% if w in [1, 2] %}sunny
+          {% elif w in [3, 4] %}partly-cloudy
+          {% elif w in [5, 6] %}cloudy
+          {% elif w == 7 %}fog
+          {% elif w in [8, 9, 10, 18, 19, 20] %}rain
+          {% elif w in [11, 21] %}thunderstorm
+          {% elif w in [12, 13, 14, 22, 23, 24] %}rain
+          {% elif w in [15, 16, 17, 25, 26, 27] %}snow
+          {% else %}cloudy{% endif %}
+
+      - name: "smhi_h1_condition"
+        unique_id: smhi_direct_h1_condition
+        state: >
+          {% set w = states('sensor.smhi_h1_wsymb') | int(0) %}
+          {% if w in [1, 2] %}sunny
+          {% elif w in [3, 4] %}partly-cloudy
+          {% elif w in [5, 6] %}cloudy
+          {% elif w == 7 %}fog
+          {% elif w in [8, 9, 10, 18, 19, 20] %}rain
+          {% elif w in [11, 21] %}thunderstorm
+          {% elif w in [12, 13, 14, 22, 23, 24] %}rain
+          {% elif w in [15, 16, 17, 25, 26, 27] %}snow
+          {% else %}cloudy{% endif %}
+
+      - name: "smhi_h2_condition"
+        unique_id: smhi_direct_h2_condition
+        state: >
+          {% set w = states('sensor.smhi_h2_wsymb') | int(0) %}
+          {% if w in [1, 2] %}sunny
+          {% elif w in [3, 4] %}partly-cloudy
+          {% elif w in [5, 6] %}cloudy
+          {% elif w == 7 %}fog
+          {% elif w in [8, 9, 10, 18, 19, 20] %}rain
+          {% elif w in [11, 21] %}thunderstorm
+          {% elif w in [12, 13, 14, 22, 23, 24] %}rain
+          {% elif w in [15, 16, 17, 25, 26, 27] %}snow
+          {% else %}cloudy{% endif %}
+
+      - name: "smhi_h3_condition"
+        unique_id: smhi_direct_h3_condition
+        state: >
+          {% set w = states('sensor.smhi_h3_wsymb') | int(0) %}
+          {% if w in [1, 2] %}sunny
+          {% elif w in [3, 4] %}partly-cloudy
+          {% elif w in [5, 6] %}cloudy
+          {% elif w == 7 %}fog
+          {% elif w in [8, 9, 10, 18, 19, 20] %}rain
+          {% elif w in [11, 21] %}thunderstorm
+          {% elif w in [12, 13, 14, 22, 23, 24] %}rain
+          {% elif w in [15, 16, 17, 25, 26, 27] %}snow
+          {% else %}cloudy{% endif %}
+
+      - name: "smhi_h4_condition"
+        unique_id: smhi_direct_h4_condition
+        state: >
+          {% set w = states('sensor.smhi_h4_wsymb') | int(0) %}
+          {% if w in [1, 2] %}sunny
+          {% elif w in [3, 4] %}partly-cloudy
+          {% elif w in [5, 6] %}cloudy
+          {% elif w == 7 %}fog
+          {% elif w in [8, 9, 10, 18, 19, 20] %}rain
+          {% elif w in [11, 21] %}thunderstorm
+          {% elif w in [12, 13, 14, 22, 23, 24] %}rain
+          {% elif w in [15, 16, 17, 25, 26, 27] %}snow
+          {% else %}cloudy{% endif %}

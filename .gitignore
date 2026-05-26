@@ -1,0 +1,25 @@
+# ESPHome build artefacts
+.esphome/
+.pioenvs/
+.piolibdeps/
+build/
+
+# Local secrets (NEVER commit)
+secrets.yaml
+*.secret.yaml
+
+# Audio test artefacts
+*.mp3
+*.wav
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+.claude/
+
+# Stray installers / binaries
+*.exe
+*.msi

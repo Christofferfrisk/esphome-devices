@@ -1,0 +1,610 @@
+esphome:
+  name: radiola1
+  friendly_name: radiola
+  min_version: 2025.9.0
+  name_add_mac_suffix: false
+  on_boot:
+    priority: -100
+    then:
+      - if:
+          condition:
+            lambda: 'return id(standby_mode);'
+          then:
+            - logger.log: "Boot in standby — skipping startup sequence"
+          else:
+            - logger.log: "ESPHome boot complete — playing startup sound"
+            - delay: 800ms  # allow DFPlayer to initialize
+            - dfplayer.set_volume: 25
+            - dfplayer.play_folder:
+                folder: 1
+                file: 2  # 002.wav
+            # --- LED startup sequence ---
+            - light.turn_on: radiola_led_1
+            - delay: 300ms
+            - light.turn_on: radiola_led_2
+            - delay: 300ms
+            - light.turn_on: radiola_led_3
+            - delay: 300ms
+            - light.turn_on: radiola_led_4
+            - delay: 300ms
+            - light.turn_on: radiola_led_5
+            - delay: 400ms
+            # --- Blink all once ---
+            - light.turn_off: radiola_led_1
+            - light.turn_off: radiola_led_2
+            - light.turn_off: radiola_led_3
+            - light.turn_off: radiola_led_4
+            - light.turn_off: radiola_led_5
+            - delay: 400ms
+            - light.turn_on: radiola_led_1
+            - light.turn_on: radiola_led_2
+            - light.turn_on: radiola_led_3
+            - light.turn_on: radiola_led_4
+            - light.turn_on: radiola_led_5
+
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+
+logger:
+  level: DEBUG
+  baud_rate: 115200
+
+api:
+
+ota:
+  - platform: esphome
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  manual_ip:
+    static_ip: 192.168.31.177
+    gateway: 192.168.31.1
+    subnet: 255.255.255.0
+
+globals:
+  - id: radio_mode
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: lp_mode
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: last_dial_mode
+    type: std::string
+    restore_value: no
+    initial_value: '"unknown"'
+  - id: standby_mode
+    type: bool
+    restore_value: no
+    initial_value: "false"
+
+# --- UART for DFPlayer Mini ---
+uart:
+  id: uart_bus
+  tx_pin: GPIO17
+  rx_pin: GPIO16
+  baud_rate: 9600
+
+# --- DFPlayer Mini ---
+dfplayer:
+  uart_id: uart_bus
+  on_finished_playback:
+    then:
+      - logger.log: "DFPlayer finished playback"
+
+i2c:
+  sda: GPIO21
+  scl: GPIO22
+  scan: true
+  frequency: 100kHz  # Slower frequency for debugging
+
+# --- ADS1115 External ADC ---
+ads1115:
+  - address: 0x48
+    id: ads1115_hub
+
+# --- PN532 NFC READER (I2C) ---
+pn532_i2c:
+  id: pn532_board
+  update_interval: 500ms
+  on_tag:
+    then:
+      - lambda: |-
+          ESP_LOGD("nfc", "NFC tag detected: %s", x.c_str());
+
+# --- LED OUTPUTS (via MOSFETs) ---
+output:
+  - platform: ledc
+    pin: GPIO27
+    id: led_1_output
+    frequency: 1000Hz
+
+  - platform: ledc
+    pin: GPIO25
+    id: led_2_output
+    frequency: 1000Hz
+
+  - platform: ledc
+    pin: GPIO32
+    id: led_3_output
+    frequency: 1000Hz
+
+  - platform: ledc
+    pin: GPIO33
+    id: led_4_output
+    frequency: 1000Hz
+
+  - platform: ledc
+    pin: GPIO26
+    id: led_5_output
+    frequency: 1000Hz
+
+  # --- PMOS Gate ---
+  - platform: ledc
+    pin: GPIO14
+    id: pmos_gate
+    inverted: false
+
+# --- LED LIGHTS (Home Assistant controllable) ---
+light:
+  - platform: monochromatic
+    name: "Radiola LED 1"
+    id: radiola_led_1
+    output: led_1_output
+    gamma_correct: 0
+    restore_mode: ALWAYS_OFF
+
+  - platform: monochromatic
+    name: "Radiola LED 2"
+    id: radiola_led_2
+    output: led_2_output
+    gamma_correct: 0
+    restore_mode: ALWAYS_OFF
+
+  - platform: monochromatic
+    name: "Radiola LED 3"
+    id: radiola_led_3
+    output: led_3_output
+    gamma_correct: 0
+    restore_mode: ALWAYS_OFF
+
+  - platform: monochromatic
+    name: "Radiola LED 4"
+    id: radiola_led_4
+    output: led_4_output
+    gamma_correct: 0
+    restore_mode: ALWAYS_OFF
+
+  - platform: monochromatic
+    name: "Radiola LED 5"
+    id: radiola_led_5
+    output: led_5_output
+    gamma_correct: 0
+    restore_mode: ALWAYS_OFF
+
+  - platform: monochromatic
+    name: "Radiola Power Rail"
+    id: radiola_power
+    output: pmos_gate
+    restore_mode: ALWAYS_ON
+
+# --- DIAL POT ON ADS1115 A0 ---
+sensor:
+  - platform: ads1115
+    ads1115_id: ads1115_hub
+    multiplexer: 'A0_GND'
+    gain: 6.144
+    name: "Dial Pot Voltage"
+    id: dial_pot_voltage
+    update_interval: 250ms
+    filters:
+      - sliding_window_moving_average:
+          window_size: 8
+          send_every: 1
+
+  - platform: template
+    id: dial_position
+    name: "Dial Position (0-100)"
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    update_interval: 250ms
+    filters:
+      - sliding_window_moving_average:
+          window_size: 10
+          send_every: 1
+      - delta: 2.0
+      - lambda: |-
+          return round(x / 2.0f) * 2.0f;
+    lambda: |-
+      float v = id(dial_pot_voltage).state;
+      if (isnan(v)) return NAN;
+      const float V_MIN = 0.010f;  // updated from 0.1480f
+      const float V_MAX = 1.185f;  // updated from 1.100f
+      float x = (v - V_MIN) / (V_MAX - V_MIN);
+      if (x < 0.0f) x = 0.0f;
+      if (x > 1.0f) x = 1.0f;
+      return x * 100.0f;
+
+  # --- VOLUME POT ON ADS1115 A1 ---
+  - platform: ads1115
+    ads1115_id: ads1115_hub
+    multiplexer: 'A1_GND'
+    gain: 6.144
+    name: "Volume Pot Voltage"
+    id: vol_pot_voltage
+    update_interval: 250ms
+    filters:
+      - sliding_window_moving_average:
+          window_size: 8
+          send_every: 1
+
+  - platform: template
+    id: vol_knob_percent
+    name: "Radiola Volume Knob"
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    update_interval: 250ms
+    filters:
+      - sliding_window_moving_average:
+          window_size: 10
+          send_every: 1
+      - delta: 3.0
+      - lambda: |-
+          return round(x / 2.0f) * 2.0f;
+    lambda: |-
+      float v = id(vol_pot_voltage).state;
+      if (isnan(v)) return NAN;
+      const float V_MIN = 0.10f;
+      const float V_MAX = 3.10f;
+      float x = (v - V_MIN) / (V_MAX - V_MIN);
+      if (x < 0.0f) x = 0.0f;
+      if (x > 1.0f) x = 1.0f;
+      return x * 100.0f;
+    on_value:
+      then:
+        # Update Sonos (media_player.kitchen) volume in Home Assistant
+        - homeassistant.service:
+            service: media_player.volume_set
+            data:
+              entity_id: media_player.kitchen
+              volume_level: !lambda 'return x / 100.0f;'
+
+# --- MODE DETECTION ---
+text_sensor:
+  - platform: template
+    name: "Radiola Standby State"
+    id: standby_state
+    update_interval: 1s
+    lambda: |-
+      return id(standby_mode) ? std::string("on") : std::string("off");
+
+  - platform: template
+    name: "Dial Mode"
+    id: dial_mode
+    update_interval: 250ms
+    lambda: |-
+      float p = id(dial_position).state;
+      if (isnan(p)) return {"unknown"};
+      const float tol = 7.0f;
+      if (p >= 25.0f - tol && p <= 25.0f + tol) return {"station_1"};
+      if (p >= 50.0f - tol && p <= 50.0f + tol) return {"station_2"};
+      if (p >= 75.0f - tol && p <= 75.0f + tol) return {"station_3"};
+      return {"noise"};
+    on_value:
+      then:
+        - if:
+            condition:
+              lambda: 'return id(radio_mode) && x != id(last_dial_mode);'
+            then:
+              - lambda: 'id(last_dial_mode) = x;'
+              - if:
+                  condition:
+                    lambda: 'return x == "noise";'
+                  then:
+                    - logger.log: "Dial -> noise"
+                    - dfplayer.play_folder:
+                        folder: 1
+                        file: 1
+                    - dfplayer.set_volume: 30
+                  else:
+                    - logger.log: "Dial -> station, stopping static"
+                    - dfplayer.stop:
+
+# --- TEST BUTTONS ---
+button:
+  - platform: template
+    name: "Test Play DFPlayer File"
+    on_press:
+      - logger.log: "Test button pressed - playing file 1 from folder 1"
+      - dfplayer.set_volume: 50
+      - dfplayer.play_folder:
+          folder: 1
+          file: 1
+
+  - platform: template
+    name: "Stop DFPlayer"
+    on_press:
+      - logger.log: "Stopping DFPlayer playback"
+      - dfplayer.stop:
+
+  - platform: template
+    name: "DFPlayer Volume Up"
+    on_press:
+      - dfplayer.set_volume: 30
+      - logger.log: "Volume set to 30"
+
+  - platform: template
+    name: "DFPlayer Volume Down"
+    on_press:
+      - dfplayer.set_volume: 10
+      - logger.log: "Volume set to 10"
+
+  - platform: template
+    name: "Toggle Radiola Power"
+    on_press:
+      - light.toggle: radiola_power
+
+binary_sensor:
+  - platform: pn532
+    pn532_id: pn532_board
+    uid: 04-41-08-E9-45-02-89
+    name: "LP: Motherload"
+    id: lp_motherload
+    on_press:
+      - if:
+          condition:
+            lambda: 'return id(lp_mode);'
+          then:
+            - logger.log: "Motherload NFC tag detected - playing LP"
+            - homeassistant.service:
+                service: media_player.play_media
+                data:
+                  entity_id: media_player.kitchen
+                  media_content_id: "spotify:album:your_motherload_album_uri"
+                  media_content_type: "music"
+
+  - platform: pn532
+    pn532_id: pn532_board
+    uid: 04-A1-8B-A2-45-02-89
+    name: "LP: Unison Life"
+    id: lp_unison_life
+    on_press:
+      - if:
+          condition:
+            lambda: 'return id(lp_mode);'
+          then:
+            - logger.log: "Unison Life NFC tag detected - playing LP"
+            - homeassistant.service:
+                service: media_player.play_media
+                data:
+                  entity_id: media_player.kitchen
+                  media_content_id: "spotify:album:your_unison_life_album_uri"
+                  media_content_type: "music"
+
+  - platform: pn532
+    pn532_id: pn532_board
+    uid: 04-41-C7-98-45-02-89
+    name: "LP: Paranoid"
+    id: lp_paranoid
+    on_press:
+      - if:
+          condition:
+            lambda: 'return id(lp_mode);'
+          then:
+            - logger.log: "Paranoid NFC tag detected - playing LP"
+            - homeassistant.service:
+                service: media_player.play_media
+                data:
+                  entity_id: media_player.kitchen
+                  media_content_id: "spotify:album:your_paranoid_album_uri"
+                  media_content_type: "music"
+
+  - platform: pn532
+    pn532_id: pn532_board
+    uid: 04-B1-D3-A8-30-02-89
+    name: "LP: Hysteria"
+    id: lp_hysteria
+    on_press:
+      - if:
+          condition:
+            lambda: 'return id(lp_mode);'
+          then:
+            - logger.log: "Hysteria NFC tag detected - playing LP"
+            - homeassistant.service:
+                service: media_player.play_media
+                data:
+                  entity_id: media_player.kitchen
+                  media_content_id: "spotify:album:your_hysteria_album_uri"
+                  media_content_type: "music"
+
+  - platform: pn532
+    pn532_id: pn532_board
+    uid: 04-61-44-9B-45-02-89
+    name: "LP: Gunship"
+    id: lp_gunship
+    on_press:
+      - if:
+          condition:
+            lambda: 'return id(lp_mode);'
+          then:
+            - logger.log: "Gunship NFC tag detected - playing LP"
+            - homeassistant.service:
+                service: media_player.play_media
+                data:
+                  entity_id: media_player.kitchen
+                  media_content_id: "spotify:album:your_gunship_album_uri"
+                  media_content_type: "music"
+
+  - platform: pn532
+    pn532_id: pn532_board
+    uid: 04-B1-66-A5-45-02-89
+    name: "LP: Tattoo You"
+    id: lp_tattoo_you
+    on_press:
+      - if:
+          condition:
+            lambda: 'return id(lp_mode);'
+          then:
+            - logger.log: "Tattoo You NFC tag detected - playing LP"
+            - homeassistant.service:
+                service: media_player.play_media
+                data:
+                  entity_id: media_player.kitchen
+                  media_content_id: "spotify:album:your_tattoo_you_album_uri"
+                  media_content_type: "music"
+
+  # --- BUTTONS ---
+  # Latching buttons — action on press only, release is ignored (mechanical release button pops them)
+  - platform: gpio
+    pin:
+      number: GPIO23
+      mode: INPUT_PULLUP
+      inverted: false
+    name: "Radiola Button 1"
+    filters:
+      - delayed_on: 50ms
+      - delayed_off: 50ms
+    on_press:
+      - lambda: |-
+          id(radio_mode) = true;
+          id(lp_mode) = false;
+          id(last_dial_mode) = "unknown";
+          ESP_LOGI("radiola", "RADIO MODE: ENABLED");
+      - dfplayer.play_folder:
+          folder: 1
+          file: 3
+
+  - platform: gpio
+    pin:
+      number: GPIO12
+      mode: INPUT_PULLUP
+      inverted: false
+    name: "Radiola Button 2"
+    filters:
+      - delayed_on: 50ms
+      - delayed_off: 50ms
+    on_press:
+      - lambda: |-
+          id(lp_mode) = true;
+          id(radio_mode) = false;
+          ESP_LOGI("radiola", "LP MODE ENABLED");
+      - dfplayer.play_folder:
+          folder: 1
+          file: 3
+
+  - platform: gpio
+    pin:
+      number: GPIO18
+      mode: INPUT_PULLUP
+      inverted: false
+    name: "Radiola Button 3"
+    filters:
+      - delayed_on: 50ms
+      - delayed_off: 50ms
+    on_press:
+      - dfplayer.play_folder:
+          folder: 1
+          file: 3
+
+  - platform: gpio
+    pin:
+      number: GPIO19
+      mode: INPUT_PULLUP
+      inverted: false
+    name: "Radiola Button 4"
+    filters:
+      - delayed_on: 50ms
+      - delayed_off: 50ms
+    on_press:
+      - dfplayer.play_folder:
+          folder: 1
+          file: 3
+
+  # --- STANDBY CONTACT PLATE ---
+  # Plate resting on GND = pin LOW = active/on
+  # Plate dialed away from GND = pin HIGH (pullup) = standby
+  - platform: gpio
+    pin:
+      number: GPIO4
+      mode: INPUT_PULLUP
+      inverted: false
+    name: "Radiola Standby Button"
+    id: standby_button
+    filters:
+      - delayed_on: 100ms
+      - delayed_off: 100ms
+    on_state:
+      - if:
+          condition:
+            lambda: 'return x;'  # plate away from GND = standby ON
+          then:
+            - lambda: |-
+                id(standby_mode) = true;
+                id(radio_mode) = false;
+                id(lp_mode) = false;
+                id(last_dial_mode) = "unknown";
+                ESP_LOGI("radiola", "STANDBY MODE: ON");
+            # Play shutdown sound first (replaces any current playback)
+            - dfplayer.set_volume: 25
+            - dfplayer.play_folder:
+                folder: 1
+                file: 4  # 004.wav shutdown sound
+            # --- LED shutdown sequence (reverse order) ---
+            - light.turn_off: radiola_led_5
+            - delay: 300ms
+            - light.turn_off: radiola_led_4
+            - delay: 300ms
+            - light.turn_off: radiola_led_3
+            - delay: 300ms
+            - light.turn_off: radiola_led_2
+            - delay: 300ms
+            - light.turn_off: radiola_led_1
+            - homeassistant.service:
+                service: media_player.media_stop
+                data:
+                  entity_id: media_player.kitchen
+            - delay: 2500ms  # allow shutdown sound to finish before cutting power
+            - light.turn_off: radiola_power
+            - logger.log: "Entering standby — LEDs off, power rail off, audio stopped"
+          else:
+            - lambda: |-
+                id(standby_mode) = false;
+                ESP_LOGI("radiola", "STANDBY MODE: OFF");
+            - light.turn_on: radiola_power
+            - delay: 500ms  # allow power rail to stabilise before playing
+            - dfplayer.set_volume: 25
+            - dfplayer.play_folder:
+                folder: 1
+                file: 2
+            # --- LED wake sequence ---
+            - light.turn_on: radiola_led_1
+            - delay: 300ms
+            - light.turn_on: radiola_led_2
+            - delay: 300ms
+            - light.turn_on: radiola_led_3
+            - delay: 300ms
+            - light.turn_on: radiola_led_4
+            - delay: 300ms
+            - light.turn_on: radiola_led_5
+            - delay: 400ms
+            # --- Blink all once ---
+            - light.turn_off: radiola_led_1
+            - light.turn_off: radiola_led_2
+            - light.turn_off: radiola_led_3
+            - light.turn_off: radiola_led_4
+            - light.turn_off: radiola_led_5
+            - delay: 400ms
+            - light.turn_on: radiola_led_1
+            - light.turn_on: radiola_led_2
+            - light.turn_on: radiola_led_3
+            - light.turn_on: radiola_led_4
+            - light.turn_on: radiola_led_5
+            - homeassistant.service:
+                service: media_player.media_play
+                data:
+                  entity_id: media_player.kitchen
+            - logger.log: "Waking from standby — power rail on, LEDs on, audio resumed"
