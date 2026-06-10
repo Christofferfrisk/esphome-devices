@@ -1,0 +1,75 @@
+substitutions:
+  name: table-leds
+  friendly_name: "Table LEDs"
+  # GPIO that the strip's DATA line is wired to. A ~330R series resistor is
+  # optional (dampens ringing on long leads); fine to omit for short wiring.
+  data_pin: GPIO14
+  # 300 LEDs = 5 m @ 60 LED/m. Change if you cut the strip.
+  num_leds: "300"
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+logger:
+
+# Home Assistant API. With the HA ESPHome integration the device
+# is auto-discovered; the key is generated on first build.
+api:
+  encryption:
+    key: !secret api_encryption_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  # Fallback hotspot if WiFi fails (captive portal to reconfigure)
+  ap:
+    ssid: "${friendly_name} Fallback"
+    password: !secret fallback_ap_password
+
+captive_portal:
+
+# ---- The LED strip ----------------------------------------------------------
+# BTF-Lighting SK6812 RGBW (WS2812B-compatible), 5V, color order GRBW.
+light:
+  - platform: esp32_rmt_led_strip
+    id: table_strip
+    name: "Strip"
+    pin: ${data_pin}
+    num_leds: ${num_leds}
+    rmt_symbols: 64
+    chipset: SK6812
+    rgb_order: GRB        # RGB ordering; the dedicated W channel is separate
+    is_rgbw: true         # SK6812 has a true white LED per pixel
+    default_transition_length: 300ms
+    effects:
+      - pulse:
+      - random:
+      - flicker:
+      - addressable_rainbow:
+      - addressable_color_wipe:
+      - addressable_twinkle:
+      - addressable_scan:
+      - addressable_fireworks:
+
+# Diagnostics in HA
+sensor:
+  - platform: wifi_signal
+    name: "WiFi Signal"
+    update_interval: 60s
+  - platform: uptime
+    name: "Uptime"
+
+text_sensor:
+  - platform: wifi_info
+    ip_address:
+      name: "IP Address"
