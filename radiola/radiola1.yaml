@@ -373,6 +373,24 @@ sensor:
       - delta: 4.0
     lambda: 'return id(dial_pos);'
 
+  # Dial position as % of the usable span, for the HA dial-face card
+  - platform: template
+    name: "Dial Position Percent"
+    id: dial_position_percent
+    unit_of_measurement: "%"
+    accuracy_decimals: 1
+    update_interval: 250ms
+    filters:
+      - delta: 0.3
+    lambda: |-
+      float lo = id(dial_min) + ${dial_guard};
+      float hi = id(dial_max) - ${dial_guard};
+      if (lo >= hi || id(dial_needs_cal)) return NAN;
+      float p = (id(dial_pos) - lo) / (hi - lo) * 100.0f;
+      if (p < 0.0f) p = 0.0f;
+      if (p > 100.0f) p = 100.0f;
+      return p;
+
   # Bring-up: raw angle mirror (the 50ms source sensor stays internal)
   - platform: template
     name: "Dial Encoder Raw (debug)"
@@ -657,6 +675,17 @@ text_sensor:
     update_interval: 1s
     lambda: |-
       return id(standby_mode) ? std::string("on") : std::string("off");
+
+  # Overall mode for the HA card: standby / radio / lp / idle
+  - platform: template
+    name: "Radiola Mode"
+    id: radiola_mode
+    update_interval: 500ms
+    lambda: |-
+      if (id(standby_mode)) return {"standby"};
+      if (id(radio_mode)) return {"radio"};
+      if (id(lp_mode)) return {"lp"};
+      return {"idle"};
 
   # Station detection from the encoder (same capture zone as snap-to-station,
   # so "on a station" and "will snap to it" always agree)
