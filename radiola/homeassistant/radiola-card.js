@@ -40,16 +40,24 @@ class RadiolaCard extends HTMLElement {
       .map((st) => {
         const x = X0 + (st.pct / 100) * (X1 - X0);
         return `
-          <line x1="${x}" y1="46" x2="${x}" y2="78" class="rc-stationline"/>
-          <text x="${x}" y="38" class="rc-stationname" text-anchor="middle">${st.name}</text>`;
+          <line x1="${x}" y1="82" x2="${x}" y2="106" class="rc-stationline"/>
+          <text x="${x}" y="74" class="rc-stationname" text-anchor="middle">${st.name}</text>`;
       })
       .join("");
     let ticks = "";
     for (let p = 0; p <= 100; p += 5) {
       const x = X0 + (p / 100) * (X1 - X0);
       const h = p % 20 === 0 ? 10 : 5;
-      ticks += `<line x1="${x}" y1="${88 - h}" x2="${x}" y2="88" class="rc-tick"/>`;
+      ticks += `<line x1="${x}" y1="${107 - h}" x2="${x}" y2="107" class="rc-tick"/>`;
     }
+    // Brand on the glass: the user's logo image if configured, otherwise a
+    // script wordmark with an underline swash in the same engraved gold
+    const logo = c.logo_url
+      ? `<image href="${c.logo_url}" x="130" y="18" width="140" height="38"
+           preserveAspectRatio="xMidYMid meet" class="rc-logoimg"/>`
+      : `<text x="200" y="46" text-anchor="middle" class="rc-logo">Radiola</text>
+         <path class="rc-swash"
+           d="M128,55 Q200,66 270,42 Q215,62 130,57 Z"/>`;
 
     this.innerHTML = `
       <ha-card>
@@ -83,6 +91,12 @@ class RadiolaCard extends HTMLElement {
           .rc-stationname { fill: #e8d49a; font-size: 12px;
             font-family: Georgia, 'Times New Roman', serif; }
           .rc-stationname.active { fill: #ffdf80; font-weight: bold; }
+          .rc-logo {
+            fill: #f0dfa8; opacity: 0.9; font-size: 34px; font-style: italic;
+            font-family: 'Brush Script MT', 'Segoe Script', 'Lucida Handwriting', cursive;
+          }
+          .rc-swash { fill: #f0dfa8; opacity: 0.75; }
+          .rc-logoimg { opacity: 0.85; filter: sepia(1) saturate(0.6) brightness(1.4); }
           .rc-needle { stroke: #e04b30; stroke-width: 2.5;
             filter: drop-shadow(0 0 3px rgba(224,75,48,0.8));
             transition: transform 0.35s ease-out; }
@@ -96,14 +110,15 @@ class RadiolaCard extends HTMLElement {
             <span class="rc-station" id="rc-station"></span>
             <button class="rc-playbtn" id="rc-play" title="Play / Pause">▶</button>
           </div>
-          <svg class="rc-dial" viewBox="0 0 400 100" id="rc-svg">
-            <rect x="20" y="14" width="360" height="80" rx="6" class="rc-glass"/>
-            <line x1="${X0}" y1="88" x2="${X1}" y2="88" class="rc-band"/>
+          <svg class="rc-dial" viewBox="0 0 400 130" id="rc-svg">
+            <rect x="20" y="12" width="360" height="106" rx="6" class="rc-glass"/>
+            ${logo}
+            <line x1="${X0}" y1="107" x2="${X1}" y2="107" class="rc-band"/>
             ${ticks}
             ${stationMarks}
-            <line x1="0" y1="16" x2="0" y2="92" class="rc-needle" id="rc-needle"
+            <line x1="0" y1="14" x2="0" y2="112" class="rc-needle" id="rc-needle"
                   transform="translate(${X0},0)"/>
-            <text x="200" y="60" text-anchor="middle" class="rc-nocal" id="rc-nocal"
+            <text x="200" y="92" text-anchor="middle" class="rc-nocal" id="rc-nocal"
                   style="display:none">dial not calibrated</text>
           </svg>
         </div>

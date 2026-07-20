@@ -39,5 +39,15 @@ stations:
 
 `stations` percentages should match the `station_*_pct` substitutions in
 `radiola1.yaml`; the names are whatever you want printed on the glass.
+
+By default the glass carries a script "Radiola" wordmark with an
+underline swash. For the real logo, save your scan (transparent PNG
+works best) as `/config/www/radiola-logo.png` and add:
+
+```yaml
+logo_url: /local/radiola-logo.png
+```
+
+The image is tinted toward the glass's gold automatically.
 Entity ids may differ slightly depending on how HA named them — check
 under the ESPHome device page.
