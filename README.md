@@ -7,7 +7,7 @@ subfolder is a self-contained device with its own YAML and notes.
 
 | Folder | Device | Hardware | What it does |
 | --- | --- | --- | --- |
-| [`radiola/`](radiola/) | Internet radio | ESP32 + DFPlayer Mini + WS2812 LEDs + AS5600 rotary encoder | Standalone "retro" internet radio: encoder volume/station selection, animated LED VU/status ring, startup sounds via DFPlayer. |
+| [`radiola/`](radiola/) | Internet radio | ESP32 + AS5600 encoder + NEMA17/A4988 motorized dial + DFPlayer Mini + PN532 NFC | Retro internet radio in an old chassis: motorized linear tuning dial with soft endstops, snap-to-station, seek, station preloading and static "swim"; NFC records trigger albums; plays via Sonos/HA. |
 | [`firebeetle/`](firebeetle/) | Weather e-ink display | DFRobot FireBeetle ESP32 + e-ink panel | Low-power deep-sleep weather display pulling forecasts directly from the SMHI open data API for Uppsala. |
 | [`table-leds/`](table-leds/) | Table LED lights | ESP32 WROOM + SK6812 RGBW strip (300 LEDs) | Addressable RGBW table lighting exposed to Home Assistant as a single light with brightness + effects. |
 

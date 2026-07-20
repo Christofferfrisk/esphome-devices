@@ -1,46 +1,96 @@
+# --- DIAL MOTOR / ENCODER TUNING ---
+substitutions:
+  # A4988 pins (placeholders — set to actual wiring before flashing)
+  dial_step_pin: GPIO13
+  dial_dir_pin: GPIO5
+  dial_enable_pin: GPIO15  # A4988 EN is active-low; floats high at boot = driver off
+  # Encoder counts (AS5600 = 4096/rev) from a limit where the motor starts resisting
+  dial_guard: "150"
+  # Encoder counts per motor (micro)step — measure: turn dial N steps, read count delta
+  dial_counts_per_step: "2.0"
+  # Station positions as % of usable dial span
+  station_1_pct: "20.0"
+  station_2_pct: "40.0"
+  station_3_pct: "60.0"
+  station_4_pct: "80.0"  # placeholder — new station, playlist TBD
+  # Snap-to-station: capture radius and "close enough" deadband, in %
+  snap_capture_pct: "5.0"
+  snap_deadband_pct: "1.0"
+  # Encoder jitter rejection: counts per 50ms sample that register as real
+  # movement, and sustained opposite travel (counts) needed to flip direction
+  dial_move_thresh: "5.0"
+  dial_dir_hyst: "20.0"
+  # Motor motion limits. NOTE: "steps/s" is at the microstep setting of the
+  # A4988 MS1-3 jumpers — tune on real hardware, start slow. Gentle
+  # acceleration matters most if the pointer runs on a dial cord.
+  # Also set the A4988 Vref (coil current) as low as reliably moves the
+  # pointer: that caps the maximum force the motor can ever exert.
+  dial_max_speed: 120 steps/s
+  dial_accel: "100"
+
 esphome:
   name: radiola1
   friendly_name: radiola
   min_version: 2025.9.0
   name_add_mac_suffix: false
   on_boot:
-    priority: -100
-    then:
-      - if:
-          condition:
-            lambda: 'return id(standby_mode);'
-          then:
-            - logger.log: "Boot in standby — skipping startup sequence"
-          else:
-            - logger.log: "ESPHome boot complete — playing startup sound"
-            - delay: 800ms  # allow DFPlayer to initialize
-            - dfplayer.set_volume: 25
-            - dfplayer.play_folder:
-                folder: 1
-                file: 2  # 002.wav
-            # --- LED startup sequence ---
-            - light.turn_on: radiola_led_1
-            - delay: 300ms
-            - light.turn_on: radiola_led_2
-            - delay: 300ms
-            - light.turn_on: radiola_led_3
-            - delay: 300ms
-            - light.turn_on: radiola_led_4
-            - delay: 300ms
-            - light.turn_on: radiola_led_5
-            - delay: 400ms
-            # --- Blink all once ---
-            - light.turn_off: radiola_led_1
-            - light.turn_off: radiola_led_2
-            - light.turn_off: radiola_led_3
-            - light.turn_off: radiola_led_4
-            - light.turn_off: radiola_led_5
-            - delay: 400ms
-            - light.turn_on: radiola_led_1
-            - light.turn_on: radiola_led_2
-            - light.turn_on: radiola_led_3
-            - light.turn_on: radiola_led_4
-            - light.turn_on: radiola_led_5
+    # Read the standby plate early so the boot check below and the sensor's
+    # initial on_state publication agree on the mode
+    - priority: 600
+      then:
+        - lambda: 'id(standby_mode) = digitalRead(4) == HIGH;'
+    - priority: -100
+      then:
+        # Dial sanity check: refuse motor moves if limits are unset or the
+        # restored position is implausible (e.g. moved while unplugged)
+        - lambda: |-
+            if (id(dial_min) >= id(dial_max)) {
+              id(dial_needs_cal) = true;
+              ESP_LOGW("dial", "Limits not set - motor disabled until calibrated (5x Button 4)");
+            } else if (id(dial_pos) < id(dial_min) - ${dial_guard} ||
+                       id(dial_pos) > id(dial_max) + ${dial_guard}) {
+              id(dial_needs_cal) = true;
+              ESP_LOGW("dial", "Restored position %.0f outside limits [%.0f, %.0f] - recalibrate (5x Button 4)",
+                       id(dial_pos), id(dial_min), id(dial_max));
+            } else {
+              id(dial_needs_cal) = false;
+            }
+        - if:
+            condition:
+              lambda: 'return id(standby_mode);'
+            then:
+              - logger.log: "Boot in standby — skipping startup sequence"
+              - switch.turn_off: radiola_power
+            else:
+              - logger.log: "ESPHome boot complete — playing startup sound"
+              - delay: 800ms  # allow DFPlayer to initialize
+              - dfplayer.set_volume: 25
+              - dfplayer.play_folder:
+                  folder: 1
+                  file: 2  # 002.wav
+              # --- LED startup sequence ---
+              - light.turn_on: radiola_led_1
+              - delay: 300ms
+              - light.turn_on: radiola_led_2
+              - delay: 300ms
+              - light.turn_on: radiola_led_3
+              - delay: 300ms
+              - light.turn_on: radiola_led_4
+              - delay: 300ms
+              - light.turn_on: radiola_led_5
+              - delay: 400ms
+              # --- Blink all once ---
+              - light.turn_off: radiola_led_1
+              - light.turn_off: radiola_led_2
+              - light.turn_off: radiola_led_3
+              - light.turn_off: radiola_led_4
+              - light.turn_off: radiola_led_5
+              - delay: 400ms
+              - light.turn_on: radiola_led_1
+              - light.turn_on: radiola_led_2
+              - light.turn_on: radiola_led_3
+              - light.turn_on: radiola_led_4
+              - light.turn_on: radiola_led_5
 
 esp32:
   board: esp32dev
@@ -81,6 +131,64 @@ globals:
     type: bool
     restore_value: no
     initial_value: "false"
+  # --- Dial motor/encoder state ---
+  - id: dial_pos          # accumulated multi-turn encoder position, counts
+    type: float
+    restore_value: yes
+    initial_value: "0"
+  - id: dial_last_raw     # previous raw AS5600 reading, for wraparound detection
+    type: float
+    restore_value: no
+    initial_value: "NAN"
+  - id: dial_min          # soft endstops, encoder counts (set via calibration)
+    type: float
+    restore_value: yes
+    initial_value: "0"
+  - id: dial_max
+    type: float
+    restore_value: yes
+    initial_value: "0"
+  - id: dial_needs_cal    # true = refuse motor moves until limits recalibrated
+    type: bool
+    restore_value: no
+    initial_value: "true"
+  - id: cal_stage         # 0 = normal, 1 = waiting for left limit, 2 = right limit
+    type: int
+    restore_value: no
+    initial_value: "0"
+  - id: cal_presses
+    type: int
+    restore_value: no
+    initial_value: "0"
+  - id: cal_last_press
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: dial_last_move   # millis() of last hand/motor dial movement, for snap settling
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: dial_dir         # last movement direction: +1 right, -1 left
+    type: int
+    restore_value: no
+    initial_value: "1"
+  - id: dial_dir_accum   # accumulated counter-direction travel, for hysteresis
+    type: float
+    restore_value: no
+    initial_value: "0"
+  - id: encoder_last_ok  # millis() of last valid AS5600 reading, for failsafe
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: static_vol       # last DFPlayer volume sent by the static swim
+    type: int
+    restore_value: no
+    initial_value: "-1"
+
+# Persist dial_pos etc. to flash more often than the 1min default,
+# so a power pull loses at most ~20s of dial movement
+preferences:
+  flash_write_interval: 20s
 
 # --- UART for DFPlayer Mini ---
 uart:
@@ -106,6 +214,24 @@ i2c:
 ads1115:
   - address: 0x48
     id: ads1115_hub
+
+# --- AS5600 DIAL ENCODER (I2C, 0x36) ---
+# NOTE: must be powered from the always-on 3.3V rail (NOT the PMOS-switched
+# rail) so the dial keeps being tracked in standby
+as5600:
+  id: dial_encoder
+
+# --- A4988 STEPPER (linear dial pointer) ---
+# EN pin is driven manually (dial_motor_enable) instead of sleep_pin, so we
+# control holding torque: coils off = knob spins free, coils on = hard to turn
+stepper:
+  - platform: a4988
+    id: dial_motor
+    step_pin: ${dial_step_pin}
+    dir_pin: ${dial_dir_pin}
+    max_speed: ${dial_max_speed}
+    acceleration: ${dial_accel}
+    deceleration: ${dial_accel}
 
 # --- PN532 NFC READER (I2C) ---
 pn532_i2c:
@@ -143,11 +269,22 @@ output:
     id: led_5_output
     frequency: 1000Hz
 
-  # --- PMOS Gate ---
-  - platform: ledc
+# --- PMOS Gate (power rail, on/off only — never PWM) ---
+switch:
+  - platform: gpio
     pin: GPIO14
-    id: pmos_gate
-    inverted: false
+    name: "Radiola Power Rail"
+    id: radiola_power
+    restore_mode: ALWAYS_ON
+
+  # A4988 EN, active-low: switch ON = coils energized
+  - platform: gpio
+    pin:
+      number: ${dial_enable_pin}
+      inverted: true
+    id: dial_motor_enable
+    name: "Dial Motor Coils"
+    restore_mode: ALWAYS_OFF
 
 # --- LED LIGHTS (Home Assistant controllable) ---
 light:
@@ -186,48 +323,51 @@ light:
     gamma_correct: 0
     restore_mode: ALWAYS_OFF
 
-  - platform: monochromatic
-    name: "Radiola Power Rail"
-    id: radiola_power
-    output: pmos_gate
-    restore_mode: ALWAYS_ON
-
-# --- DIAL POT ON ADS1115 A0 ---
 sensor:
-  - platform: ads1115
-    ads1115_id: ads1115_hub
-    multiplexer: 'A0_GND'
-    gain: 6.144
-    name: "Dial Pot Voltage"
-    id: dial_pot_voltage
-    update_interval: 250ms
-    filters:
-      - sliding_window_moving_average:
-          window_size: 8
-          send_every: 1
+  # Raw AS5600 angle (0-4095), polled fast; accumulates a multi-turn
+  # position in dial_pos by detecting wraparound between reads
+  - platform: as5600
+    as5600_id: dial_encoder
+    id: dial_encoder_raw
+    internal: true
+    update_interval: 50ms
+    on_value:
+      - lambda: |-
+          if (isnan(x)) return;
+          id(encoder_last_ok) = millis();
+          if (isnan(id(dial_last_raw))) {
+            id(dial_last_raw) = x;
+            return;
+          }
+          float d = x - id(dial_last_raw);
+          if (d > 2048.0f) d -= 4096.0f;
+          else if (d < -2048.0f) d += 4096.0f;
+          id(dial_last_raw) = x;
+          id(dial_pos) += d;
+          if (fabsf(d) >= ${dial_move_thresh}) {
+            id(dial_last_move) = millis();
+            // Direction with hysteresis: movement agreeing with the current
+            // direction resets the counter; only sustained opposite travel flips
+            if ((d > 0) == (id(dial_dir) > 0)) {
+              id(dial_dir_accum) = 0;
+            } else {
+              id(dial_dir_accum) += d;
+              if (fabsf(id(dial_dir_accum)) >= ${dial_dir_hyst}) {
+                id(dial_dir) = (d > 0) ? 1 : -1;
+                id(dial_dir_accum) = 0;
+              }
+            }
+          }
 
   - platform: template
-    id: dial_position
-    name: "Dial Position (0-100)"
-    unit_of_measurement: "%"
+    name: "Dial Encoder Position"
+    id: dial_encoder_position
+    unit_of_measurement: "counts"
     accuracy_decimals: 0
-    update_interval: 250ms
+    update_interval: 500ms
     filters:
-      - sliding_window_moving_average:
-          window_size: 10
-          send_every: 1
-      - delta: 2.0
-      - lambda: |-
-          return round(x / 2.0f) * 2.0f;
-    lambda: |-
-      float v = id(dial_pot_voltage).state;
-      if (isnan(v)) return NAN;
-      const float V_MIN = 0.010f;  // updated from 0.1480f
-      const float V_MAX = 1.185f;  // updated from 1.100f
-      float x = (v - V_MIN) / (V_MAX - V_MIN);
-      if (x < 0.0f) x = 0.0f;
-      if (x > 1.0f) x = 1.0f;
-      return x * 100.0f;
+      - delta: 4.0
+    lambda: 'return id(dial_pos);'
 
   # --- VOLUME POT ON ADS1115 A1 ---
   - platform: ads1115
@@ -266,12 +406,222 @@ sensor:
       return x * 100.0f;
     on_value:
       then:
-        # Update Sonos (media_player.kitchen) volume in Home Assistant
-        - homeassistant.service:
-            service: media_player.volume_set
-            data:
-              entity_id: media_player.kitchen
-              volume_level: !lambda 'return x / 100.0f;'
+        # Update Sonos volume — but not while tuning through static in radio
+        # mode, or we'd unmute the silently-preloading next station
+        - if:
+            condition:
+              lambda: 'return !(id(radio_mode) && id(dial_mode).state == "noise");'
+            then:
+              - homeassistant.service:
+                  service: media_player.volume_set
+                  data:
+                    entity_id: media_player.kitchen
+                    volume_level: !lambda 'return x / 100.0f;'
+
+# --- DIAL SOFT-ENDSTOP WATCHDOG ---
+interval:
+  - interval: 100ms
+    then:
+      - lambda: |-
+          if (id(cal_stage) != 0 || id(dial_needs_cal)) return;
+          // Encoder failsafe: no valid reading for >1s means we are blind —
+          // stop the motor and lock out moves until recalibrated
+          if (millis() - id(encoder_last_ok) > 1000) {
+            id(dial_motor_enable).turn_off();
+            id(dial_needs_cal) = true;
+            ESP_LOGE("dial", "Encoder silent >1s - motor disabled, recalibrate (5x Button 4)");
+            return;
+          }
+          if (id(standby_mode)) {
+            // Track only in standby — but let a running park move finish first
+            if (id(dial_motor).has_reached_target()) id(dial_motor_enable).turn_off();
+            return;
+          }
+          float pos = id(dial_pos);
+          float lo = id(dial_min);
+          float hi = id(dial_max);
+          if (lo >= hi) return;
+          const float GUARD = ${dial_guard};
+          const float CPS = ${dial_counts_per_step};
+          if (pos < lo + GUARD || pos > hi - GUARD) {
+            // Spring-back zone: drive toward the safe span. Turning inward is
+            // assisted, outward is resisted — never locked, never trapped
+            float back = (pos < lo + GUARD) ? (lo + GUARD) : (hi - GUARD);
+            id(dial_motor_enable).turn_on();
+            id(dial_motor).report_position((int32_t) (pos / CPS));
+            id(dial_motor).set_target((int32_t) (back / CPS));
+          } else if (!id(dial_motor).has_reached_target()) {
+            // a commanded move (dial_goto) is still running — leave it alone
+          } else {
+            id(dial_motor_enable).turn_off();
+          }
+
+  # Blink the end LED matching the limit being calibrated
+  - interval: 400ms
+    then:
+      - lambda: |-
+          if (id(cal_stage) == 1) id(radiola_led_1).toggle().perform();
+          else if (id(cal_stage) == 2) id(radiola_led_5).toggle().perform();
+
+  # Static "swim": between stations the hiss follows the volume knob and
+  # grows with distance from the nearest station, like tuning a real band.
+  # Only sends a UART command when the computed volume actually changes.
+  - interval: 250ms
+    then:
+      - if:
+          condition:
+            lambda: |-
+              if (!id(radio_mode) || id(standby_mode) || id(dial_needs_cal) || id(cal_stage) != 0) return false;
+              if (id(dial_mode).state != "noise") return false;
+              float lo = id(dial_min) + ${dial_guard};
+              float hi = id(dial_max) - ${dial_guard};
+              if (lo >= hi) return false;
+              float p = (id(dial_pos) - lo) / (hi - lo) * 100.0f;
+              const float st[4] = {${station_1_pct}, ${station_2_pct}, ${station_3_pct}, ${station_4_pct}};
+              float off = 1000.0f;
+              for (float s : st) off = std::min(off, fabsf(p - s));
+              const float tol = ${snap_capture_pct};
+              const float half_gap = (${station_2_pct} - ${station_1_pct}) / 2.0f;
+              float f = (off - tol) / (half_gap - tol);
+              if (f < 0.0f) f = 0.0f;
+              if (f > 1.0f) f = 1.0f;
+              float knob = id(vol_knob_percent).state;
+              if (isnan(knob)) knob = 50.0f;
+              int vol = (int) roundf(f * knob / 100.0f * 30.0f);
+              if (vol == id(static_vol)) return false;
+              id(static_vol) = vol;
+              return true;
+          then:
+            - dfplayer.set_volume: !lambda 'return id(static_vol);'
+
+  # Snap-to-station: once the hand-turned dial settles near a station,
+  # gently pull the pointer to dead center (radio mode only)
+  - interval: 250ms
+    then:
+      - lambda: |-
+          if (!id(radio_mode) || id(standby_mode) || id(dial_needs_cal) || id(cal_stage) != 0) return;
+          if (!id(dial_motor).has_reached_target()) return;      // a move is running
+          if (millis() - id(dial_last_move) < 600) return;       // still being turned
+          float lo = id(dial_min) + ${dial_guard};
+          float hi = id(dial_max) - ${dial_guard};
+          if (lo >= hi) return;
+          float pct = (id(dial_pos) - lo) / (hi - lo) * 100.0f;
+          const float stations[4] = {${station_1_pct}, ${station_2_pct}, ${station_3_pct}, ${station_4_pct}};
+          for (float s : stations) {
+            float off = fabsf(pct - s);
+            if (off <= ${snap_capture_pct} && off > ${snap_deadband_pct}) {
+              ESP_LOGI("dial", "Snap: %.1f%% -> station at %.0f%%", pct, s);
+              id(dial_goto_pct).execute(s);
+              break;
+            }
+          }
+
+# --- DIAL MOTOR MOVES (always clamped to the soft endstops) ---
+script:
+  - id: dial_goto
+    mode: restart
+    parameters:
+      target_counts: float
+    then:
+      - lambda: |-
+          if (id(dial_needs_cal) || id(cal_stage) != 0) {
+            ESP_LOGW("dial", "Limits not calibrated - refusing motor move");
+            return;
+          }
+          if (id(standby_mode)) {
+            ESP_LOGW("dial", "In standby (12V rail off) - refusing motor move");
+            return;
+          }
+          const float CPS = ${dial_counts_per_step};
+          float lo = id(dial_min) + ${dial_guard};
+          float hi = id(dial_max) - ${dial_guard};
+          float t = target_counts;
+          if (t < lo) t = lo;
+          if (t > hi) t = hi;
+          id(dial_motor_enable).turn_on();
+          id(dial_motor).report_position((int32_t) (id(dial_pos) / CPS));
+          id(dial_motor).set_target((int32_t) (t / CPS));
+
+  # Move to a % of the usable span (0 = left limit+guard, 100 = right limit-guard)
+  - id: dial_goto_pct
+    mode: restart
+    parameters:
+      pct: float
+    then:
+      - lambda: |-
+          float lo = id(dial_min) + ${dial_guard};
+          float hi = id(dial_max) - ${dial_guard};
+          if (lo >= hi) return;
+          float p = pct;
+          if (p < 0.0f) p = 0.0f;
+          if (p > 100.0f) p = 100.0f;
+          id(dial_goto).execute(lo + (p / 100.0f) * (hi - lo));
+
+  # Seek: sweep to the next station rightward (wrap to first), static hissing
+  # during the sweep like a real band scan
+  - id: dial_seek
+    mode: single
+    then:
+      - lambda: |-
+          float lo = id(dial_min) + ${dial_guard};
+          float hi = id(dial_max) - ${dial_guard};
+          if (lo >= hi) return;
+          float pct = (id(dial_pos) - lo) / (hi - lo) * 100.0f;
+          const float stations[4] = {${station_1_pct}, ${station_2_pct}, ${station_3_pct}, ${station_4_pct}};
+          float next = stations[0];
+          for (float s : stations) {
+            if (s > pct + 2.0f) { next = s; break; }
+          }
+          ESP_LOGI("dial", "Seek: %.1f%% -> station at %.0f%%", pct, next);
+          id(dial_goto_pct).execute(next);
+      - dfplayer.set_volume: !lambda |-
+          float k = id(vol_knob_percent).state;
+          if (isnan(k)) k = 50.0f;
+          return (int) roundf(k / 100.0f * 30.0f);
+      - dfplayer.play_folder:
+          folder: 1
+          file: 1  # static
+      - wait_until:
+          condition:
+            lambda: 'return id(dial_motor).has_reached_target();'
+          timeout: 20s
+      - dfplayer.stop:
+
+  # Park the pointer at the left end on standby (bypasses the standby guard
+  # in dial_goto — the 12V rail is still up at this point in the shutdown)
+  - id: dial_park
+    mode: restart
+    then:
+      - lambda: |-
+          if (id(dial_needs_cal) || id(cal_stage) != 0) return;
+          float lo = id(dial_min) + ${dial_guard};
+          if (lo >= id(dial_max) - ${dial_guard}) return;
+          const float CPS = ${dial_counts_per_step};
+          ESP_LOGI("dial", "Parking pointer at left end");
+          id(dial_motor_enable).turn_on();
+          id(dial_motor).report_position((int32_t) (id(dial_pos) / CPS));
+          id(dial_motor).set_target((int32_t) (lo / CPS));
+
+# --- LP ALBUM PROGRESS (fed by a Home Assistant automation) ---
+# HA writes 0-100 from the Sonos media position; in LP mode the pointer
+# tracks across the dial like a stylus over the record
+number:
+  - platform: template
+    name: "LP Progress"
+    id: lp_progress
+    min_value: 0
+    max_value: 100
+    step: 1
+    initial_value: 0
+    optimistic: true
+    on_value:
+      - if:
+          condition:
+            lambda: 'return id(lp_mode) && !id(standby_mode) && !id(dial_needs_cal);'
+          then:
+            - script.execute:
+                id: dial_goto_pct
+                pct: !lambda 'return x;'
 
 # --- MODE DETECTION ---
 text_sensor:
@@ -282,18 +632,51 @@ text_sensor:
     lambda: |-
       return id(standby_mode) ? std::string("on") : std::string("off");
 
+  # Station detection from the encoder (same capture zone as snap-to-station,
+  # so "on a station" and "will snap to it" always agree)
   - platform: template
     name: "Dial Mode"
     id: dial_mode
     update_interval: 250ms
     lambda: |-
-      float p = id(dial_position).state;
-      if (isnan(p)) return {"unknown"};
-      const float tol = 7.0f;
-      if (p >= 25.0f - tol && p <= 25.0f + tol) return {"station_1"};
-      if (p >= 50.0f - tol && p <= 50.0f + tol) return {"station_2"};
-      if (p >= 75.0f - tol && p <= 75.0f + tol) return {"station_3"};
+      if (id(dial_needs_cal) || id(cal_stage) != 0) return {"unknown"};
+      float lo = id(dial_min) + ${dial_guard};
+      float hi = id(dial_max) - ${dial_guard};
+      if (lo >= hi) return {"unknown"};
+      float p = (id(dial_pos) - lo) / (hi - lo) * 100.0f;
+      const float tol = ${snap_capture_pct};
+      if (fabsf(p - ${station_1_pct}) <= tol) return {"station_1"};
+      if (fabsf(p - ${station_2_pct}) <= tol) return {"station_2"};
+      if (fabsf(p - ${station_3_pct}) <= tol) return {"station_3"};
+      if (fabsf(p - ${station_4_pct}) <= tol) return {"station_4"};
       return {"noise"};
+
+  # Preload prediction: while tuning through noise, name the station we're
+  # heading toward so HA can start its playlist muted before we arrive.
+  # "none" = nothing to preload (on a station, past the last one, etc.)
+  - platform: template
+    name: "Radiola Preload Station"
+    id: preload_station
+    update_interval: 250ms
+    lambda: |-
+      if (!id(radio_mode) || id(standby_mode) || id(dial_needs_cal) || id(cal_stage) != 0)
+        return {"none"};
+      if (id(dial_mode).state != "noise") return {"none"};
+      float lo = id(dial_min) + ${dial_guard};
+      float hi = id(dial_max) - ${dial_guard};
+      if (lo >= hi) return {"none"};
+      float p = (id(dial_pos) - lo) / (hi - lo) * 100.0f;
+      const float st[4] = {${station_1_pct}, ${station_2_pct}, ${station_3_pct}, ${station_4_pct}};
+      int target = -1;
+      if (id(dial_dir) > 0) {
+        for (int i = 0; i < 4; i++) if (st[i] > p) { target = i; break; }
+      } else {
+        for (int i = 3; i >= 0; i--) if (st[i] < p) { target = i; break; }
+      }
+      if (target < 0) return {"none"};
+      char buf[12];
+      snprintf(buf, sizeof(buf), "station_%d", target + 1);
+      return {std::string(buf)};
     on_value:
       then:
         - if:
@@ -306,10 +689,12 @@ text_sensor:
                     lambda: 'return x == "noise";'
                   then:
                     - logger.log: "Dial -> noise"
+                    # Start quiet at the zone edge; the swim interval ramps
+                    # the hiss with distance from the station
+                    - dfplayer.set_volume: 1
                     - dfplayer.play_folder:
                         folder: 1
                         file: 1
-                    - dfplayer.set_volume: 30
                   else:
                     - logger.log: "Dial -> station, stopping static"
                     - dfplayer.stop:
@@ -346,7 +731,7 @@ button:
   - platform: template
     name: "Toggle Radiola Power"
     on_press:
-      - light.toggle: radiola_power
+      - switch.toggle: radiola_power
 
 binary_sensor:
   - platform: pn532
@@ -506,9 +891,39 @@ binary_sensor:
       - delayed_on: 50ms
       - delayed_off: 50ms
     on_press:
-      - dfplayer.play_folder:
-          folder: 1
-          file: 3
+      # In calibration mode this button captures the limits; otherwise normal
+      - if:
+          condition:
+            lambda: 'return id(cal_stage) != 0;'
+          then:
+            - lambda: |-
+                if (id(cal_stage) == 1) {
+                  id(dial_min) = id(dial_pos);
+                  id(cal_stage) = 2;
+                  ESP_LOGI("dial", "CAL: left limit saved (%.0f). Turn dial to RIGHT stop, press Button 3", id(dial_min));
+                } else {
+                  float a = id(dial_min);
+                  float b = id(dial_pos);
+                  id(dial_min) = std::min(a, b);
+                  id(dial_max) = std::max(a, b);
+                  id(cal_stage) = 0;
+                  id(dial_needs_cal) = false;
+                  global_preferences->sync();
+                  ESP_LOGI("dial", "CAL: done. Limits [%.0f, %.0f] saved to flash", id(dial_min), id(dial_max));
+                }
+            - light.turn_on: radiola_led_1
+            - light.turn_on: radiola_led_5
+          else:
+            # Radio mode: seek to next station; otherwise the old test sound
+            - if:
+                condition:
+                  lambda: 'return id(radio_mode) && !id(dial_needs_cal) && !id(standby_mode);'
+                then:
+                  - script.execute: dial_seek
+                else:
+                  - dfplayer.play_folder:
+                      folder: 1
+                      file: 3
 
   - platform: gpio
     pin:
@@ -520,9 +935,25 @@ binary_sensor:
       - delayed_on: 50ms
       - delayed_off: 50ms
     on_press:
-      - dfplayer.play_folder:
-          folder: 1
-          file: 3
+      # 5 presses within 3s enters limit calibration; single press = normal
+      - lambda: |-
+          uint32_t now = millis();
+          if (now - id(cal_last_press) > 3000) id(cal_presses) = 0;
+          id(cal_last_press) = now;
+          id(cal_presses) += 1;
+          if (id(cal_presses) >= 5) {
+            id(cal_presses) = 0;
+            id(cal_stage) = 1;
+            id(dial_motor_enable).turn_off();  // free the knob for hand positioning
+            ESP_LOGI("dial", "CAL: started. Turn dial to LEFT stop, press Button 3");
+          }
+      - if:
+          condition:
+            lambda: 'return id(cal_stage) == 0;'
+          then:
+            - dfplayer.play_folder:
+                folder: 1
+                file: 3
 
   # --- STANDBY CONTACT PLATE ---
   # Plate resting on GND = pin LOW = active/on
@@ -538,9 +969,16 @@ binary_sensor:
       - delayed_on: 100ms
       - delayed_off: 100ms
     on_state:
+      # Ignore the initial publication at boot (mode already set in on_boot)
+      # and any repeat publications that don't change the mode
       - if:
           condition:
-            lambda: 'return x;'  # plate away from GND = standby ON
+            lambda: 'return x == id(standby_mode);'
+          then:
+            - logger.log: "Standby state unchanged — ignoring"
+      - if:
+          condition:
+            lambda: 'return x != id(standby_mode) && x;'  # plate away from GND = standby ON
           then:
             - lambda: |-
                 id(standby_mode) = true;
@@ -567,14 +1005,25 @@ binary_sensor:
                 service: media_player.media_stop
                 data:
                   entity_id: media_player.kitchen
+            # Park the pointer while the shutdown sound plays
+            - script.execute: dial_park
             - delay: 2500ms  # allow shutdown sound to finish before cutting power
-            - light.turn_off: radiola_power
+            - wait_until:
+                condition:
+                  lambda: 'return id(dial_motor).has_reached_target();'
+                timeout: 10s
+            - switch.turn_off: dial_motor_enable
+            - switch.turn_off: radiola_power
+            - lambda: 'global_preferences->sync();  // flush dial position to flash'
             - logger.log: "Entering standby — LEDs off, power rail off, audio stopped"
-          else:
+      - if:
+          condition:
+            lambda: 'return x != id(standby_mode) && !x;'  # plate on GND = wake
+          then:
             - lambda: |-
                 id(standby_mode) = false;
                 ESP_LOGI("radiola", "STANDBY MODE: OFF");
-            - light.turn_on: radiola_power
+            - switch.turn_on: radiola_power
             - delay: 500ms  # allow power rail to stabilise before playing
             - dfplayer.set_volume: 25
             - dfplayer.play_folder:
