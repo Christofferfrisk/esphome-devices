@@ -103,6 +103,10 @@ logger:
 
 api:
 
+# Bring-up dashboard: live sensors + buttons at http://<device-ip>
+web_server:
+  port: 80
+
 ota:
   - platform: esphome
 
@@ -369,6 +373,14 @@ sensor:
       - delta: 4.0
     lambda: 'return id(dial_pos);'
 
+  # Bring-up: raw angle mirror (the 50ms source sensor stays internal)
+  - platform: template
+    name: "Dial Encoder Raw (debug)"
+    unit_of_measurement: "counts"
+    accuracy_decimals: 0
+    update_interval: 250ms
+    lambda: 'return id(dial_last_raw);'
+
   # --- VOLUME POT ON ADS1115 A1 ---
   - platform: ads1115
     ads1115_id: ads1115_hub
@@ -455,6 +467,20 @@ interval:
           } else {
             id(dial_motor_enable).turn_off();
           }
+
+  # Bring-up: one dial state line per second in the log stream
+  - interval: 1s
+    then:
+      - lambda: |-
+          float lo = id(dial_min) + ${dial_guard};
+          float hi = id(dial_max) - ${dial_guard};
+          float pct = (lo < hi) ? (id(dial_pos) - lo) / (hi - lo) * 100.0f : NAN;
+          ESP_LOGI("dial-dbg", "raw=%.0f pos=%.0f pct=%.1f%% dir=%+d lim=[%.0f,%.0f] cal=%s coils=%s tgt=%s",
+                   id(dial_last_raw), id(dial_pos), pct, id(dial_dir),
+                   id(dial_min), id(dial_max),
+                   id(dial_needs_cal) ? "NEEDED" : "ok",
+                   id(dial_motor_enable).state ? "ON" : "off",
+                   id(dial_motor).has_reached_target() ? "reached" : "moving");
 
   # Blink the end LED matching the limit being calibrated
   - interval: 400ms
@@ -732,6 +758,27 @@ button:
     name: "Toggle Radiola Power"
     on_press:
       - switch.toggle: radiola_power
+
+  # --- BRING-UP: jog the motor a known step count to measure
+  # dial_counts_per_step (encoder delta / 100). Deliberately bypasses the
+  # calibration lockout — no endstops, watch the pointer!
+  - platform: template
+    name: "Dial Jog +100 Steps"
+    on_press:
+      - lambda: |-
+          ESP_LOGW("dial-dbg", "Jog +100: pos before = %.0f", id(dial_pos));
+          id(dial_motor_enable).turn_on();
+          id(dial_motor).report_position(0);
+          id(dial_motor).set_target(100);
+
+  - platform: template
+    name: "Dial Jog -100 Steps"
+    on_press:
+      - lambda: |-
+          ESP_LOGW("dial-dbg", "Jog -100: pos before = %.0f", id(dial_pos));
+          id(dial_motor_enable).turn_on();
+          id(dial_motor).report_position(0);
+          id(dial_motor).set_target(-100);
 
 binary_sensor:
   - platform: pn532
