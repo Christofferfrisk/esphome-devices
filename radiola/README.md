@@ -10,7 +10,7 @@ fixed positions on the band, and static hisses between them.
 - **MCU:** ESP32 dev board (`esp32dev`)
 - **Dial:** knob-driven linear pointer on a dial cord, with
   - AS5600 magnetic rotary encoder (I2C, `0x36`) for absolute position
-  - NEMA17 stepper + A4988 driver so the radio can also move the dial
+  - NEMA17 stepper + DRV8825 driver so the radio can also move the dial
     itself (seek, snap-to-station, standby park, LP progress)
 - **Audio:** DFPlayer Mini (UART) with static/chime WAVs on microSD;
   music playback happens on a Sonos (`media_player.kitchen`) via HA
@@ -74,16 +74,29 @@ stations and NFC albums are still placeholders in the config.
 
 ## First-hardware checklist
 
-1. Set real A4988 pins in `substitutions` (`dial_step_pin` etc. are
+1. Set real DRV8825 pins in `substitutions` (`dial_step_pin` etc. are
    placeholders)
 2. `esphome config radiola1.yaml` — validates the `as5600`/`stepper`
    schemas against your ESPHome version
 3. Measure `dial_counts_per_step` (command N steps, read encoder delta)
-4. Set the A4988 Vref as low as reliably moves the pointer — this caps
+4. Set the DRV8825 Vref as low as reliably moves the pointer — this caps
    the force the motor can ever exert on the dial cord
 5. Tune `dial_max_speed` / `dial_accel` (values are in steps/s at the
-   MS1-3 microstep setting)
+   DRV8825 MODE0-2 microstep setting)
 6. Run the limit calibration (above)
+
+### DRV8825 essentials
+
+- `EN` is active-low; the firmware's `Dial Motor Coils` switch already
+  accounts for this.
+- Tie `nSLEEP` and `nRESET` high (normally together) or the driver will
+  ignore STEP pulses. Leave `FAULT` unconnected unless a spare, protected
+  ESP32 input is available for it.
+- Put at least a 100 uF electrolytic capacitor directly across `VMOT` and
+  motor GND. Do not plug or unplug the NEMA17 while the driver has power.
+- The usual Pololu-style DRV8825 carrier with 0.1-ohm sense resistors uses
+  `current limit = 2 x Vref`. Verify your board's documentation before
+  setting it, then start at the lowest current that moves the dial reliably.
 
 ## Build
 
