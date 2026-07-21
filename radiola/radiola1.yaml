@@ -1,9 +1,9 @@
 # --- DIAL MOTOR / ENCODER TUNING ---
 substitutions:
-  # A4988 pins (placeholders — set to actual wiring before flashing)
+  # DRV8825 pins (placeholders — set to actual wiring before flashing)
   dial_step_pin: GPIO13
   dial_dir_pin: GPIO5
-  dial_enable_pin: GPIO15  # A4988 EN is active-low; floats high at boot = driver off
+  dial_enable_pin: GPIO15  # DRV8825 EN is active-low; floats high at boot = driver off
   # Encoder counts (AS5600 = 4096/rev) from a limit where the motor starts resisting
   dial_guard: "150"
   # Encoder counts per motor (micro)step — measure: turn dial N steps, read count delta
@@ -21,9 +21,9 @@ substitutions:
   dial_move_thresh: "5.0"
   dial_dir_hyst: "20.0"
   # Motor motion limits. NOTE: "steps/s" is at the microstep setting of the
-  # A4988 MS1-3 jumpers — tune on real hardware, start slow. Gentle
+  # DRV8825 MODE0-2 jumpers — tune on real hardware, start slow. Gentle
   # acceleration matters most if the pointer runs on a dial cord.
-  # Also set the A4988 Vref (coil current) as low as reliably moves the
+  # Also set the DRV8825 Vref (coil current) as low as reliably moves the
   # pointer: that caps the maximum force the motor can ever exert.
   dial_max_speed: 120 steps/s
   dial_accel: "100"
@@ -225,7 +225,9 @@ ads1115:
 as5600:
   id: dial_encoder
 
-# --- A4988 STEPPER (linear dial pointer) ---
+# --- DRV8825 STEPPER (linear dial pointer) ---
+# ESPHome calls this generic STEP/DIR driver platform "a4988"; it is also
+# electrically compatible with a DRV8825.
 # EN pin is driven manually (dial_motor_enable) instead of sleep_pin, so we
 # control holding torque: coils off = knob spins free, coils on = hard to turn
 stepper:
@@ -281,7 +283,7 @@ switch:
     id: radiola_power
     restore_mode: ALWAYS_ON
 
-  # A4988 EN, active-low: switch ON = coils energized
+  # DRV8825 EN, active-low: switch ON = coils energized
   - platform: gpio
     pin:
       number: ${dial_enable_pin}
