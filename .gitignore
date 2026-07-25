@@ -8,6 +8,12 @@ build/
 secrets.yaml
 *.secret.yaml
 
+# Local safety snapshots
+*.before_*.pdf
+*.before_*.yaml
+*.before_*.py
+*_before_power_switch_fix.yaml
+
 # Audio test artefacts
 *.mp3
 *.wav

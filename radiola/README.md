@@ -21,7 +21,7 @@ fixed positions on the band, and static hisses between them.
   shutdown sequences and calibration feedback
 - **Controls:** 4 latching piano-key buttons (mechanical interlock, one
   at a time) + a standby contact plate on GPIO4
-- **Power:** PMOS-switched 12V rail (GPIO14, on/off only — never PWM);
+- **Power:** PMOS-switched 5V rail (GPIO14, on/off only — never PWM);
   the AS5600 must be fed from the always-on 3.3V rail so the dial keeps
   being tracked in standby
 
@@ -47,7 +47,12 @@ derives from it:
   station the dial is heading toward (direction-aware, with jitter
   hysteresis) so HA can start its playlist muted before arrival.
 - **Standby park** — entering standby glides the pointer to the left
-  end while the shutdown sound plays, then cuts the 12V rail.
+  end while the shutdown sound plays, then cuts the 5V rail.
+- **Automatic standby** — after 3 minutes without physical interaction,
+  the normal shutdown sequence runs. Dial or volume movement, Radio/LP
+  selection, or NFC activity resets the timer and wakes an automatic
+  standby. Motor-driven snap/park movement does not count; the physical
+  standby plate remains authoritative.
 - **Failsafe** — if the encoder goes silent for >1 s the motor is
   disabled and moves are locked out until recalibrated.
 
