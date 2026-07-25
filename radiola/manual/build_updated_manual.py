@@ -14,7 +14,7 @@ from reportlab.pdfgen.canvas import Canvas
 
 
 ROOT = Path(__file__).resolve().parent.parent
-SOURCE = ROOT / "Radiola_Build_Schema_before_circuit_update.pdf"
+SOURCE = Path(__file__).with_name("Radiola_Manual_Base.pdf")
 REFERENCE = Path(__file__).with_name("Radiola_Circuit_Wiring_Reference_v18.pdf")
 OUTPUT = ROOT / "Radiola_Build_Schema.pdf"
 
