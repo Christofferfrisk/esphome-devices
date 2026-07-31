@@ -3,14 +3,31 @@ esphome:
   on_boot:
     priority: 600
     then:
-      - lambda: 'id(just_woke) = true;'
-      # --- 90s safe window so HA/OTA can connect ---
-      - logger.log: "Boot: staying awake 90s for HA/OTA window."
       - deep_sleep.prevent: deep_sleep_ctrl
-      - script.execute: wait_for_data_then_refresh   # draw during the window
-      - delay: 90s
+      - script.execute: wait_for_data_then_refresh
 
-      # After the window, decide mode based on HA button + quiet hours
+      # Keep the long OTA window only after a cold/manual boot. Timer wakes
+      # proceed as soon as their single display refresh has completed.
+      - if:
+          condition:
+            lambda: 'return esp_sleep_get_wakeup_cause() != ESP_SLEEP_WAKEUP_TIMER;'
+          then:
+            - logger.log: "Cold/manual boot: keeping the 90s HA/OTA window."
+            - delay: 90s
+          else:
+            - logger.log: "Timer wake: refreshing once, then sleeping."
+
+      # Never enter sleep while data acquisition or an e-paper refresh is active.
+      - wait_until:
+          condition:
+            lambda: |-
+              return !id(wait_for_data_then_refresh).is_running() &&
+                     !id(schedule_refresh).is_running() &&
+                     !id(schedule_refresh_full).is_running();
+          timeout: 150s
+
+      - lambda: 'id(boot_sequence_complete) = true;'
+
       - if:
           condition:
             lambda: 'return id(stay_awake_flag).has_state() && id(stay_awake_flag).state;'
@@ -46,14 +63,10 @@ wifi:
     subnet: 255.255.255.0
 
 globals:
-  - id: initial_draw_done
+  - id: boot_sequence_complete
     type: bool
     restore_value: no
     initial_value: 'false'
-
-  - id: just_woke
-    type: bool
-    restore_value: no
 
 deep_sleep:
   id: deep_sleep_ctrl
@@ -82,6 +95,10 @@ script:
             lambda: |-
               auto t = id(ha_time).now();
               if (!t.is_valid()) return false;
+              if (!id(stay_awake_flag).has_state()) return false;
+              int mins = t.hour * 60 + t.minute;
+              bool quiet = (mins >= (23*60+45)) || (mins < (8*60+30));
+              if (quiet) return true;  // The Sover page only needs a valid clock.
               bool ready_weather =
                 id(smhi_temp).has_state() &&
                 id(smhi_h1_time).has_state() &&
@@ -89,22 +106,21 @@ script:
                 id(smhi_h1_condition).has_state();
               bool ready_run   = id(garmin_run_days).has_state()   || id(garmin_ran_today).has_state();
               bool ready_bike  = id(garmin_bike_days).has_state()  || id(garmin_biked_today).has_state();
-              return ready_weather && (ready_run || ready_bike);
+              bool ready_calendar = id(epd_month_badges).has_state() && id(epd_today_calendar_events).has_state();
+              return ready_weather && (ready_run || ready_bike) && ready_calendar;
           timeout: 60s
 
-      - script.execute: schedule_refresh
-      - lambda: 'id(just_woke) = false;'
+      - script.execute: schedule_refresh_full
 
 
 
   # -------------------------------------------------------------
-  # BWR-safe full refresh (double waveform)
+  # One complete BWR e-paper refresh
   # -------------------------------------------------------------
   - id: schedule_refresh_full
     mode: restart
     then:
       - component.update: battery_voltage
-      - component.update: epd
       - component.update: epd
 
 
@@ -116,11 +132,12 @@ script:
     then:
       - wait_until:
           condition:
-            lambda: 'return !id(schedule_refresh).is_running() && !id(schedule_refresh_full).is_running();'
-          timeout: 60s
-      - deep_sleep.enter:
-          id: deep_sleep_ctrl
-          sleep_duration: !lambda |-
+            lambda: |-
+              return !id(wait_for_data_then_refresh).is_running() &&
+                     !id(schedule_refresh).is_running() &&
+                     !id(schedule_refresh_full).is_running();
+          timeout: 150s
+      - lambda: |-
             uint32_t ms = 5UL * 60UL * 1000UL;
             auto t = id(ha_time).now();
             if (t.is_valid()) {
@@ -143,11 +160,15 @@ script:
                 int next_half = (t.minute < 30) ? 30 : 60;
                 int remaining_s = (next_half*60) - (t.minute*60 + t.second);
                 if (remaining_s <= 0) remaining_s = 30*60;
+                // Wake at 23:45 to render Sover rather than waiting until midnight.
+                int until_quiet_s = (QUIET_START * 60) - (mins * 60 + secs);
+                if (until_quiet_s > 0 && until_quiet_s < remaining_s) remaining_s = until_quiet_s;
                 ms = (uint32_t)remaining_s * 1000UL;
               }
             }
             ESP_LOGI("sleep", "Deep sleeping for %u ms", (unsigned)ms);
-            return ms;
+            id(deep_sleep_ctrl).set_sleep_duration(ms);
+            id(deep_sleep_ctrl).begin_sleep(true);
 
 
 spi:
@@ -159,7 +180,7 @@ font:
     id: roboto
     size: 30
     glyphs:
-      - &sv_glyphs " ABCDEFGHIJKLMNOPQRSTUVWXYZÅÄÖabcdefghijklmnopqrstuvwxyzåäö0123456789°:/.%—-"
+      - &sv_glyphs " ABCDEFGHIJKLMNOPQRSTUVWXYZÅÄÖabcdefghijklmnopqrstuvwxyzåäö0123456789°:/.%—-,;'!?&()[]+"
 
   - file: "fonts/Roboto-Medium.ttf"
     id: roboto_h1
@@ -245,19 +266,25 @@ font:
   - file: 'fonts/materialdesignicons-webfont.ttf'
     id: font_mdi_badge
     size: 36
-    glyphs:
+    glyphs: &mdi-badge-glyphs
       - "\U000F02A0"  # ghost
-      - "\U000F0250"  # fish
+      - "\U000F023A"  # fish
       - "\U000F0240"  # flag-variant
       - "\U000F024A"  # flower
       - "\U000F05E2"  # candle
       - "\U000F0E30"  # firework
-      - "\U000F050F"  # fire
-      - "\U000F018F"  # earth
-      - "\U000F0768"  # clover
+      - "\U000F0238"  # fire
+      - "\U000F01E7"  # earth
+      - "\U000F0816"  # clover
       - "\U000F00EB"  # cake-variant
-      - "\U000F0157"  # trophy
+      - "\U000F0538"  # trophy
       - "\U000F12BA" # string_lights
+      - "\U000F00ED"  # calendar
+
+  - file: 'fonts/materialdesignicons-webfont.ttf'
+    id: font_mdi_badge_small
+    size: 30
+    glyphs: *mdi-badge-glyphs
 
   - file: 'fonts/materialdesignicons-webfont.ttf'
     id: font_mdi_run_24
@@ -283,7 +310,11 @@ text_sensor:
     entity_id: input_text.garmin_run_days_this_month
     on_value:
       then:
-        - script.execute: schedule_refresh
+        - if:
+            condition:
+              lambda: 'return id(stay_awake_flag).has_state() && id(stay_awake_flag).state;'
+            then:
+              - script.execute: schedule_refresh
 
   - platform: homeassistant
     id: garmin_bike_days
@@ -292,7 +323,13 @@ text_sensor:
   - platform: homeassistant
     id: epd_board_theme
     entity_id: sensor.epd_board_theme
-    on_value: { then: [ script.execute: schedule_refresh ] }
+    on_value:
+      then:
+        - if:
+            condition:
+              lambda: 'return id(stay_awake_flag).has_state() && id(stay_awake_flag).state;'
+            then:
+              - script.execute: schedule_refresh
 
   - platform: homeassistant
     id: epd_month_badges
@@ -302,7 +339,22 @@ text_sensor:
         - logger.log:
             format: "epd_month_badges received: %s"
             args: ['id(epd_month_badges).state.c_str()']
-        - script.execute: schedule_refresh
+        - if:
+            condition:
+              lambda: 'return id(stay_awake_flag).has_state() && id(stay_awake_flag).state;'
+            then:
+              - script.execute: schedule_refresh
+
+  - platform: homeassistant
+    id: epd_today_calendar_events
+    entity_id: input_text.epd_today_calendar_events
+    on_value:
+      then:
+        - if:
+            condition:
+              lambda: 'return id(stay_awake_flag).has_state() && id(stay_awake_flag).state;'
+            then:
+              - script.execute: schedule_refresh
 
   # ── SMHI hourly times (now individual sensors, no attribute) ──────────────
 
@@ -361,11 +413,6 @@ text_sensor:
     entity_id: sensor.smhi_condition
 
   - platform: homeassistant
-    id: epd_theme
-    entity_id: sensor.epd_theme
-    on_value: { then: [ script.execute: schedule_refresh ] }
-
-  - platform: homeassistant
     id: sunrise_hhmm
     entity_id: sensor.sunrise_hhmm
   - platform: homeassistant
@@ -379,7 +426,7 @@ sensor:
     pin: GPIO34
     id: battery_voltage
     name: "Battery Voltage"
-    attenuation: 11db
+    attenuation: 12db
     update_interval: never
     filters:
       - multiply: 2.0
@@ -440,28 +487,42 @@ binary_sensor:
       then:
         - if:
             condition:
-              lambda: 'return id(stay_awake_flag).state;'
+              lambda: 'return id(boot_sequence_complete);'
             then:
-              - logger.log: "Stay-awake ON — preventing deep sleep."
-              - deep_sleep.prevent: deep_sleep_ctrl
-              - lambda: 'id(just_woke) = true;'
-              - script.execute: wait_for_data_then_refresh
-            else:
-              - logger.log: "Stay-awake OFF — resuming 30-min cycle."
-              - deep_sleep.allow: deep_sleep_ctrl
-              - lambda: 'id(just_woke) = true;'
-              - script.execute: wait_for_data_then_refresh
-              - script.execute: sleep_until_next_wake
+              - if:
+                  condition:
+                    lambda: 'return id(stay_awake_flag).state;'
+                  then:
+                    - logger.log: "Stay-awake ON — preventing deep sleep."
+                    - deep_sleep.prevent: deep_sleep_ctrl
+                    - script.execute: wait_for_data_then_refresh
+                  else:
+                    - logger.log: "Stay-awake OFF — resuming 30-min cycle."
+                    - deep_sleep.allow: deep_sleep_ctrl
+                    - script.execute: wait_for_data_then_refresh
+                    - script.execute: sleep_until_next_wake
 
   - platform: homeassistant
     id: garmin_ran_today
     entity_id: binary_sensor.garmin_ran_today
-    on_state: { then: [ script.execute: schedule_refresh ] }
+    on_state:
+      then:
+        - if:
+            condition:
+              lambda: 'return id(stay_awake_flag).has_state() && id(stay_awake_flag).state;'
+            then:
+              - script.execute: schedule_refresh
 
   - platform: homeassistant
     id: garmin_biked_today
     entity_id: binary_sensor.garmin_biked_today
-    on_state: { then: [ script.execute: schedule_refresh ] }
+    on_state:
+      then:
+        - if:
+            condition:
+              lambda: 'return id(stay_awake_flag).has_state() && id(stay_awake_flag).state;'
+            then:
+              - script.execute: schedule_refresh
 
 time:
   - platform: homeassistant
@@ -473,6 +534,7 @@ time:
           - if:
               condition:
                 lambda: |-
+                  if (!(id(stay_awake_flag).has_state() && id(stay_awake_flag).state)) return false;
                   auto t = id(ha_time).now();
                   if (!t.is_valid()) return false;
                   int mins = t.hour * 60 + t.minute;
@@ -488,20 +550,16 @@ time:
               then: { script.execute: schedule_refresh }
               else: { logger.log: "Skipping refresh: quiet hours or data not ready." }
 
-      # ±15 min window around midnight — catches device waking slightly before/after 00:00
+      # In stay-awake mode, switch to the Sover page once at quiet-hours start.
       - seconds: 0
-        minutes: 45,50,55
+        minutes: 45
         hours: 23
-        then: { script.execute: schedule_refresh }
-      - seconds: 0
-        minutes: 0,5,10,15
-        hours: 0
-        then: { script.execute: schedule_refresh }
-
-      - seconds: 0
-        minutes: 30
-        hours: 8
-        then: { script.execute: schedule_refresh }
+        then:
+          - if:
+              condition:
+                lambda: 'return id(stay_awake_flag).has_state() && id(stay_awake_flag).state;'
+              then:
+                - script.execute: schedule_refresh
 
 display:
   - platform: waveshare_epaper
@@ -538,16 +596,18 @@ display:
         if (name.empty()) return nullptr;
         std::string k = name; std::transform(k.begin(), k.end(), k.begin(), ::tolower);
         if (k == "ghost")                         return "\U000F02A0";
-        if (k == "fish")                          return "\U000F0250";
+        if (k == "fish")                          return "\U000F023A";
         if (k == "flag-variant" || k == "flag")   return "\U000F0240";
         if (k == "flower")                        return "\U000F024A";
         if (k == "candle")                        return "\U000F05E2";
         if (k == "firework")                      return "\U000F0E30";
-        if (k == "fire")                          return "\U000F050F";
-        if (k == "earth")                         return "\U000F018F";
-        if (k == "clover")                        return "\U000F0768";
+        if (k == "fire")                          return "\U000F0238";
+        if (k == "earth")                         return "\U000F01E7";
+        if (k == "clover")                        return "\U000F0816";
         if (k == "cake-variant" || k == "cake")   return "\U000F00EB";
-        if (k == "trophy")                        return "\U000F0157";
+        if (k == "trophy")                        return "\U000F0538";
+        if (k == "string-lights" || k == "pine-tree") return "\U000F12BA";
+        if (k == "calendar" || k == "event")      return "\U000F00ED";
         if (k == "pumpkin")                       return "\U000F02A0"; // fallback to ghost
         return nullptr;
       };
@@ -585,18 +645,6 @@ display:
       // ----- Board THEME badge (top-right) from HA (sensor.epd_board_theme) -----
       std::string theme = (id(epd_board_theme).has_state() && id(epd_board_theme).state.length()>0)
                           ? std::string(id(epd_board_theme).state.c_str()) : std::string("none");
-      const char* theme_icon = nullptr;
-      {
-        std::string t = theme; std::transform(t.begin(), t.end(), t.begin(), ::tolower);
-        if      (t == "halloween")     theme_icon = mdi_icon_for("ghost");
-        else if (t == "christmas")     theme_icon = mdi_icon_for("pine-tree");
-        else if (t == "kraftskiva")    theme_icon = mdi_icon_for("fish");
-        else if (t == "national_day")  theme_icon = mdi_icon_for("flag-variant");
-        else if (t == "valborg")       theme_icon = mdi_icon_for("fire");
-        else if (t == "midsummer")     theme_icon = mdi_icon_for("flower");
-        else if (t == "olympics")      theme_icon = mdi_icon_for("trophy");
-      }
-
       // pick sprinkle icon to match theme (used later)
       const char* sprinkle_icon = nullptr;
       {
@@ -844,15 +892,6 @@ display:
         }
 
         const int NUM_FONT_H = 24;     // roboto_small size
-        const int RUN_FONT_H = 24;     // font_mdi_run_24 size
-
-        bool ran_today_flag =
-          (id(garmin_ran_today).has_state() && id(garmin_ran_today).state) ||
-          ((today >= 1 && today <= 31) ? ran_day[today] : false);
-
-        bool biked_today_flag =
-          (id(garmin_biked_today).has_state() && id(garmin_biked_today).state) ||
-          ((today >= 1 && today <= 31) ? biked_day[today] : false);
 
         int start_y = cal_y + header_gap;
         for (int d = 1; d <= dim; ++d) {
@@ -882,25 +921,27 @@ display:
             it.print(x, y, id(roboto_small), day_col, TextAlign::TOP_CENTER, buf);
           }
 
-          // 2) Per-day badge from HA (with optional run/bike stack)
+          // 2) Calendar badge plus at most one Garmin activity, side by side.
           if (has_badge) {
             const char* badge_icon = mdi_icon_for(badge_it->second);
             if (badge_icon != nullptr) {
-              it.print(x, y - 8, id(font_mdi_badge), RED, TextAlign::TOP_CENTER, badge_icon);
+              bool has_garmin = ran_on_day || biked_on_day;
+              int badge_x = has_garmin ? x - 13 : x;
+              int activity_x = x + 16;
 
-              const int ICON_NUDGE_Y = 2;
-
-              int stack_y = y + 18 + (RUN_FONT_H / 2);
-
-              if (ran_on_day && biked_on_day) {
-                it.print(x - 10, stack_y + ICON_NUDGE_Y, id(font_mdi_run_24), RED, TextAlign::CENTER, "\U000F070E");
-                it.print(x + 10, stack_y + ICON_NUDGE_Y, id(font_mdi_run_24), RED, TextAlign::CENTER, "\U000F00A3");
-              } else if (ran_on_day) {
-                it.print(x, stack_y + ICON_NUDGE_Y, id(font_mdi_run_24), RED, TextAlign::CENTER, "\U000F070E");
-              } else if (biked_on_day) {
-                it.print(x, stack_y + ICON_NUDGE_Y, id(font_mdi_run_24), RED, TextAlign::CENTER, "\U000F00A3");
+              // Preserve the today marker even when a calendar icon is present.
+              if (is_today) {
+                int radius = has_garmin ? 25 : 18;
+                for (int k = 0; k < 3; ++k) it.circle(x, cy + 1, radius - k, RED);
               }
-              continue; // skip default today highlight when badge is present
+
+              it.print(badge_x, y - 4, id(font_mdi_badge_small), RED, TextAlign::TOP_CENTER, badge_icon);
+              if (has_garmin) {
+                // If both Garmin activities exist, running gets the single Garmin slot.
+                const char* activity_icon = ran_on_day ? "\U000F070E" : "\U000F00A3";
+                it.print(activity_x, cy + 2, id(font_mdi_run_24), RED, TextAlign::CENTER, activity_icon);
+              }
+              continue;
             }
           }
 
@@ -935,7 +976,89 @@ display:
         int last_row   = (first_mon_idx + dim - 1) / 7;
         int cal_bottom = start_y + last_row * row_gap;
 
-        int footer_y   = cal_bottom + 150;
+        // Borderless text area for today's Google Calendar items. Format from HA:
+        // "mdi-name|text;mdi-name|text". HA only populates this helper
+        // for events that overlap the current local date.
+        if (id(epd_today_calendar_events).has_state() &&
+            id(epd_today_calendar_events).state.length() > 0) {
+          std::string events = id(epd_today_calendar_events).state.c_str();
+          size_t start = 0;
+          int event_index = 0;
+
+          auto text_width = [&](const std::string &text) -> int {
+            int x1, y1, width, height;
+            it.get_text_bounds(0, 0, text.c_str(), id(roboto_small),
+                               TextAlign::TOP_LEFT, &x1, &y1, &width, &height);
+            return width;
+          };
+
+          auto trim_utf8_char = [](std::string &text) {
+            if (text.empty()) return;
+            size_t pos = text.size() - 1;
+            while (pos > 0 && (static_cast<unsigned char>(text[pos]) & 0xC0) == 0x80) --pos;
+            text.erase(pos);
+          };
+
+          auto fit_with_ellipsis = [&](std::string text, int max_width) -> std::string {
+            const std::string suffix = "...";
+            while (!text.empty() && text_width(text + suffix) > max_width) trim_utf8_char(text);
+            return text.empty() ? suffix : text + suffix;
+          };
+
+          auto wrap_text = [&](const std::string &text, int max_width) -> std::vector<std::string> {
+            std::vector<std::string> lines;
+            std::string current;
+            size_t pos = 0;
+            while (pos < text.size()) {
+              while (pos < text.size() && text[pos] == ' ') ++pos;
+              if (pos >= text.size()) break;
+              size_t end = text.find(' ', pos);
+              std::string word = text.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
+              std::string candidate = current.empty() ? word : current + " " + word;
+              if (text_width(candidate) <= max_width) {
+                current = candidate;
+              } else {
+                if (!current.empty()) lines.push_back(current);
+                current = text_width(word) <= max_width ? word : fit_with_ellipsis(word, max_width);
+              }
+              if (end == std::string::npos) break;
+              pos = end + 1;
+            }
+            if (!current.empty()) lines.push_back(current);
+            if (lines.empty()) lines.push_back("");
+            if (lines.size() > 2) {
+              lines.resize(2);
+              lines[1] = fit_with_ellipsis(lines[1], max_width);
+            }
+            return lines;
+          };
+
+          while (start <= events.size() && event_index < 2) {
+            size_t sep = events.find(';', start);
+            std::string token = events.substr(start, sep == std::string::npos
+                                                      ? std::string::npos
+                                                      : sep - start);
+            size_t pipe = token.find('|');
+            std::string icon_name = pipe == std::string::npos ? "calendar" : token.substr(0, pipe);
+            std::string label = pipe == std::string::npos ? token : token.substr(pipe + 1);
+            const char* event_icon = mdi_icon_for(icon_name);
+            int event_y = cal_bottom + 48 + event_index * 54;
+            if (event_icon != nullptr) {
+              it.print(24, event_y - 5, id(font_mdi_badge), RED, TextAlign::TOP_CENTER, event_icon);
+            }
+            const int text_center_x = (50 + W - 8) / 2;
+            std::vector<std::string> wrapped = wrap_text(label, W - 68);
+            for (size_t i = 0; i < wrapped.size() && i < 2; ++i) {
+              it.print(text_center_x, event_y + static_cast<int>(i) * 24,
+                       id(roboto_small), BLACK, TextAlign::TOP_CENTER, wrapped[i].c_str());
+            }
+            ++event_index;
+            if (sep == std::string::npos) break;
+            start = sep + 1;
+          }
+        }
+
+        int footer_y   = cal_bottom + 168;
 
         // Footer timestamp
         it.strftime(W/2, footer_y, id(roboto_small), BLACK, TextAlign::TOP_CENTER,
@@ -944,7 +1067,9 @@ display:
         // Battery icon + percentage (bottom right)
         if (id(battery_voltage).has_state()) {
           float vbat = id(battery_voltage).state;
-          float pct = (vbat - 3.3f) / (4.2f - 3.3f) * 100.0f;
+          // The display becomes unreliable at the old 30% point. Remap
+          // that voltage (3.57 V) to 0%, while retaining 4.20 V as 100%.
+          float pct = (vbat - 3.57f) / (4.2f - 3.57f) * 100.0f;
           pct = std::max(0.0f, std::min(100.0f, pct));
           const char* bat_icon;
           if      (pct >= 95) bat_icon = "\U000F0079"; // 100%

@@ -9,16 +9,17 @@ data API.
 - **MCU:** DFRobot FireBeetle ESP32 (`firebeetle32`)
 - **Display:** e-ink panel
 - **Power:** Battery-friendly — uses ESPHome `deep_sleep` between
-  refreshes with a 90 s safe window after every boot for HA control
-  and OTA updates
+  refreshes. Timer wakes refresh once and return to sleep; a cold or manual
+  boot provides a 90 s Home Assistant/OTA window.
 
 ## How it works
 
-- **`firebeetle-display.yaml`** — the device configuration. On boot
-  the firmware stays awake 90 s to allow Home Assistant to push state
-  and OTA updates to land, then either keeps running (if the HA
-  `stay_awake_flag` switch is on) or schedules deep sleep until the
-  next scheduled wake. Honours quiet hours.
+- **`firebeetle-display.yaml`** — the device configuration. On a timer wake,
+  the firmware waits for Home Assistant data, performs one e-paper refresh,
+  and sleeps until the next scheduled wake. A cold or manual boot keeps a
+  90 s window for Home Assistant and OTA access. The HA `stay_awake_flag`
+  switch disables deep sleep when maintenance is needed. At 23:45 it renders
+  the quiet-hours page once and then sleeps until 08:30.
 
 - **`smhi_direct.yaml`** — a Home Assistant package that fetches the
   SMHI open-data point forecast for Uppsala (lat 59.8586, lon 17.6389)
