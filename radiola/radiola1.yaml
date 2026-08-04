@@ -149,9 +149,10 @@ globals:
     type: bool
     restore_value: no
     initial_value: "false"
-  # Automatic standby uses the same full transition as the physical standby
-  # plate, but can be cancelled by a new front-panel interaction.
-  - id: auto_standby
+  # After an idle timeout the front-panel LEDs simply dim off (a low-key
+  # "screensaver"). Any front-panel interaction lights them again; power, audio
+  # and the dial are left running.
+  - id: leds_dimmed
     type: bool
     restore_value: no
     initial_value: "false"
@@ -323,7 +324,7 @@ switch:
   - platform: gpio
     pin:
       number: GPIO14
-      inverted: true
+      inverted: false
     name: "Radiola Power Rail"
     id: radiola_power
     restore_mode: ALWAYS_ON
@@ -515,27 +516,25 @@ sensor:
 
 # --- DIAL SOFT-ENDSTOP WATCHDOG ---
 interval:
-  # Shut down after three minutes without a physical interaction. Reuse the
-  # normal standby transition so sound, LEDs, Sonos, dial park, motor release,
-  # and the power rail retain their established sequencing.
+  # Dim the front-panel LEDs off after three minutes without a physical
+  # interaction. Power, audio, Sonos and the dial keep running; register_activity
+  # lights the LEDs again on the next front-panel interaction.
   - interval: 1s
     then:
       - if:
           condition:
             lambda: |-
-              return !id(standby_mode) && !id(auto_standby) &&
+              return !id(standby_mode) && !id(leds_dimmed) &&
                      millis() - id(last_user_activity) >= 180000;
           then:
             - lambda: |-
-                id(auto_standby) = true;
-                id(standby_mode) = true;
-                id(radio_mode) = false;
-                id(lp_mode) = false;
-                id(last_dial_mode) = "unknown";
-                ESP_LOGI("radiola", "AUTO STANDBY: 3 minutes without activity");
-            - script.execute:
-                id: standby_transition
-                entering: true
+                id(leds_dimmed) = true;
+                ESP_LOGI("radiola", "AUTO DIM: 3 minutes without activity - LEDs off");
+            - light.turn_off: radiola_led_1
+            - light.turn_off: radiola_led_2
+            - light.turn_off: radiola_led_3
+            - light.turn_off: radiola_led_4
+            - light.turn_off: radiola_led_5
 
   - interval: 100ms
     then:
@@ -720,7 +719,7 @@ interval:
   - interval: 1s
     then:
       - lambda: |-
-          if (id(standby_mode)) return;
+          if (id(standby_mode) || id(leds_dimmed)) return;
           if (id(dial_needs_cal) || id(cal_stage) != 0)
             id(radiola_led_5).toggle().perform();
 
@@ -749,28 +748,28 @@ interval:
 # --- DIAL MOTOR MOVES (always clamped to the soft endstops) ---
 script:
   # All real front-panel activity comes through here. Physical standby remains
-  # authoritative; automatic standby wakes and restores the latched mode.
+  # authoritative; while active, activity refreshes the idle timer and re-lights
+  # the LEDs if the idle dimmer has turned them off.
   - id: register_activity
     mode: restart
     then:
       - if:
           condition:
-            lambda: 'return id(auto_standby) && !id(standby_button).state;'
+            lambda: 'return !id(standby_mode);'
           then:
-            - lambda: |-
-                id(auto_standby) = false;
-                id(standby_mode) = false;
-                id(last_user_activity) = millis();
-                ESP_LOGI("radiola", "AUTO STANDBY: waking on user activity");
-            - script.execute:
-                id: standby_transition
-                entering: false
-          else:
+            - lambda: 'id(last_user_activity) = millis();'
             - if:
                 condition:
-                  lambda: 'return !id(standby_mode);'
+                  lambda: 'return id(leds_dimmed);'
                 then:
-                  - lambda: 'id(last_user_activity) = millis();'
+                  - lambda: |-
+                      id(leds_dimmed) = false;
+                      ESP_LOGI("radiola", "AUTO DIM: activity - LEDs back on");
+                  - light.turn_on: radiola_led_1
+                  - light.turn_on: radiola_led_2
+                  - light.turn_on: radiola_led_3
+                  - light.turn_on: radiola_led_4
+                  - light.turn_on: radiola_led_5
 
   - id: dial_goto
     mode: restart
@@ -904,7 +903,9 @@ script:
       - lambda: |-
           id(radio_mode) = true;
           id(lp_mode) = false;
-          id(last_dial_mode) = "unknown";
+          // Suppress the dial's repeated current-state callback while the
+          // spoken Radio cue plays. A real dial movement still interrupts it.
+          id(last_dial_mode) = id(dial_mode).state;
           ESP_LOGI("radiola", "RADIO MODE: ON (GPIO18)");
       - if:
           condition:
@@ -912,11 +913,17 @@ script:
               return !id(standby_mode) && !id(dial_needs_cal) &&
                      id(cal_stage) == 0 && id(dial_mode).state == "noise";
           then:
-            - logger.log: "Radio mode entered between stations - starting static"
-            - script.execute: start_radio_static
+            # Mark noise as handled so the dial callback does not interrupt
+            # the spoken mode cue. on_finished_playback starts static afterward.
+            - logger.log: "Radio mode entered between stations - static will follow the mode cue"
             - lambda: 'id(last_dial_mode) = "noise";'
           else:
             - dfplayer.stop:
+      - logger.log: "Radio mode selected - playing 005.wav"
+      - dfplayer.set_volume: 30
+      - dfplayer.play_folder:
+          folder: 1
+          file: 5
 
   - id: enter_lp_mode
     mode: restart
@@ -928,6 +935,11 @@ script:
           id(last_dial_mode) = "unknown";
           ESP_LOGI("radiola", "LP MODE: ON (GPIO19)");
       - dfplayer.stop:
+      - logger.log: "Vinyl mode selected - playing 006.wav"
+      - dfplayer.set_volume: 30
+      - dfplayer.play_folder:
+          folder: 1
+          file: 6
 
   # One restartable transition prevents delayed actions from an old standby
   # event racing a newer wake event (or vice versa).
@@ -1615,13 +1627,11 @@ binary_sensor:
           }
           id(standby_mode) = x;
           if (x) {
-            id(auto_standby) = false;
             id(radio_mode) = false;
             id(lp_mode) = false;
             id(last_dial_mode) = "unknown";
             ESP_LOGI("radiola", "STANDBY MODE: ON");
           } else {
-            id(auto_standby) = false;
             id(last_user_activity) = millis();
             ESP_LOGI("radiola", "STANDBY MODE: OFF");
           }
