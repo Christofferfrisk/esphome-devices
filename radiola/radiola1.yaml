@@ -116,6 +116,10 @@ logger:
     sensor: WARN
 
 api:
+  # An HA restart or briefly-unreachable server must not reboot the device
+  # (a reboot forces a full dial recalibration). Hold the session and wait
+  # for HA to reconnect instead of self-rebooting after the default 15 min.
+  reboot_timeout: 0s
 
 # Bring-up dashboard: live sensors + buttons at http://<device-ip>
 web_server:
@@ -124,9 +128,20 @@ web_server:
 ota:
   - platform: esphome
 
+# Diagnostics: expose the ESP reset reason (see the "Reset Reason" text_sensor
+# below), plus uptime and WiFi signal, so an unexpected reboot — which forces a
+# full dial recalibration — is self-explaining in Home Assistant.
+debug:
+  update_interval: 30s
+
 wifi:
   ssid: !secret wifi_ssid
   password: !secret wifi_password
+  # A WiFi/AP dropout must not reboot the ESP: the dial and audio work offline,
+  # and every reboot wipes the calibration. Keep retrying the connection forever
+  # instead of self-rebooting after the default 15 min.
+  reboot_timeout: 0s
+  fast_connect: true
   manual_ip:
     static_ip: 192.168.31.177
     gateway: 192.168.31.1
@@ -513,6 +528,17 @@ sensor:
             data:
               entity_id: media_player.kitchen
               volume_level: !lambda 'return x / 100.0f;'
+
+  # --- DIAGNOSTICS (reset reason is a text_sensor further down) ---
+  - platform: uptime
+    name: "Uptime"
+    entity_category: diagnostic
+    update_interval: 60s
+
+  - platform: wifi_signal
+    name: "WiFi Signal"
+    entity_category: diagnostic
+    update_interval: 60s
 
 # --- DIAL SOFT-ENDSTOP WATCHDOG ---
 interval:
@@ -1172,6 +1198,13 @@ text_sensor:
       char buf[12];
       snprintf(buf, sizeof(buf), "station_%d", target + 1);
       return {std::string(buf)};
+
+  # Why the ESP last rebooted — the key diagnostic for calibration loss
+  # (e.g. "Brownout reset", "Software reset", "Power on reset").
+  - platform: debug
+    reset_reason:
+      name: "Reset Reason"
+      entity_category: diagnostic
 
 # --- TEST BUTTONS ---
 button:
